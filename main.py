@@ -28,30 +28,36 @@ class Settings:
     # --- Управление сервами ---
     MIN_ANGLE = 30
     MAX_ANGLE = 150
-    DEADBAND_PX = 10                 # было 4 — сделаем больше, чтобы не «рыскал»
-    MAX_STEP_DEG = 2.5               # было 5.0 — мягче шаг
+    DEADBAND_PX = 10                 # мёртвая зона пикселей
+    MAX_STEP_DEG = 2.5               # ограничение шага за итерацию
 
-    # --- PID (теперь PI: P + I) ---
-    KP = 0.18                        # стартовое значение (0.15–0.25)
-    KI = 0.015                       # медленная подтяжка остаточной ошибки
+    # --- PI (P + I) ---
+    KP = 0.18                        # 0.15–0.25 обычно хорошо
+    KI = 0.015
     KD = 0.0
-    SMOOTH_FACTOR = 0.6              # сглаживание ошибки
+    SMOOTH_FACTOR = 0.6
     BIAS_LIMIT = 15.0
 
     # --- Состояния / гистерезис ---
-    MISS_FRAMES_TO_SEARCH = 45       # было 12 — меньше дребезга состояний
+    MISS_FRAMES_TO_SEARCH = 45       # ~1.5s при 30 FPS
 
-    # --- Поиск цели (спираль в SEARCH) ---
+    # --- Спираль поиска (SEARCH) ---
     SEARCH_RADIUS_STEP = 2.5
     SEARCH_ANGLE_STEP = 18
 
     # --- Serial ---
     BAUDRATE = 115200
     RECONNECT_DELAY_S = 2.0
-    CMD_HZ = 25.0                    # лимит частоты отправки углов (Гц)
+    CMD_HZ = 25.0                    # частота отправки углов
+
+    # --- Протокол команд к Arduino: "DUAL", "XY", "ANG" ---
+    PROTOCOL_MODE = "DUAL"
 
     # --- Калибровка ---
     CALIB_PATH = "calib.json"
+
+    # --- Отладка печатью в консоль ---
+    DEBUG_TX = False
 
 
 def clamp(v, vmin, vmax):
@@ -71,17 +77,13 @@ class PIDController:
         self.last_error = 0.0
 
     def calculate_step(self, error, Kp):
-        # Сглаживаем ошибку, копим интегральную составляющую в пределах
         self.smoothed_error = (
             self.smooth_factor * self.smoothed_error
             + (1 - self.smooth_factor) * error
         )
         self.bias = clamp(self.bias + self.Ki * self.smoothed_error,
                           -self.bias_limit, self.bias_limit)
-
-        # PI: пропорциональная + интегральная часть
-        step = Kp * self.smoothed_error + self.bias
-        return step
+        return Kp * self.smoothed_error + self.bias
 
     def reset(self):
         self.bias = 0.0
@@ -145,7 +147,7 @@ class TurretController:
         self.search_radius = 0.0
         self.search_angle = 0.0
 
-        # Память цели и точка лазера для гистерезиса
+        # Память цели и лазера
         self.prev_target = None
         self.prev_target_time = 0.0
         self.last_laser_seen = 0.0
@@ -160,61 +162,48 @@ class TurretController:
     # ---------- Инициализация ----------
 
     def _init_camera(self):
-        try:
-            picam2 = Picamera2()
-            config = picam2.create_preview_configuration(
-                main={"format": "RGB888", "size": self.settings.FRAME_SIZE}
-            )
-            picam2.configure(config)
-            picam2.start()
-            print("[CAMERA] ok")
-            return picam2
-        except Exception as e:
-            print(f"[CAMERA] Ошибка: {e}")
-            raise
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(
+            main={"format": "RGB888", "size": self.settings.FRAME_SIZE}
+        )
+        picam2.configure(config)
+        picam2.start()
+        print("[CAMERA] ok")
+        return picam2
 
     def _init_model(self):
-        try:
-            model = YOLO(self.settings.MODEL_PATH)
-            self.name2id = {v: k for k, v in model.names.items()}
-            self.wanted_ids = [self.name2id[n]
-                               for n in self.settings.WANTED_CLASSES
-                               if n in self.name2id]
-            print(f"[MODEL] Загружено. Классы: {self.settings.WANTED_CLASSES}")
-            return model
-        except Exception as e:
-            print(f"[MODEL] Ошибка: {e}")
-            raise
+        model = YOLO(self.settings.MODEL_PATH)
+        self.name2id = {v: k for k, v in model.names.items()}
+        self.wanted_ids = [self.name2id[n]
+                           for n in self.settings.WANTED_CLASSES
+                           if n in self.name2id]
+        print(f"[MODEL] Загружено. Классы: {self.settings.WANTED_CLASSES}")
+        return model
 
     def connect_serial(self):
         """Автопоиск /dev/ttyUSB*|ttyACM* и подключение."""
         if self.ser and self.ser.is_open:
             return True
-        try:
-            port = next((p.device for p in serial.tools.list_ports.comports()
-                         if "/ttyUSB" in p.device or "/ttyACM" in p.device), None)
-            if not port:
-                print("[SERIAL] Arduino не найдена.")
-                self.ser = None
-                return False
-            self.ser = serial.Serial(port, self.settings.BAUDRATE, timeout=0.1)
-            time.sleep(1.8)  # ждём автоперезапуск Arduino
-            print(f"[SERIAL] Подключено: {port}")
-            # необязательный хендшейк:
-            try:
-                self.ser.reset_input_buffer()
-                self.ser.write(b"PING\r\n")
-                time.sleep(0.2)
-                data = self.ser.read(100).decode(errors="ignore")
-                if data:
-                    print("[SERIAL] RX:", data.strip())
-            except Exception:
-                pass
-            return True
-        except serial.SerialException as e:
-            print(f"[SERIAL] Ошибка: {e}")
+        port = next((p.device for p in serial.tools.list_ports.comports()
+                     if "/ttyUSB" in p.device or "/ttyACM" in p.device), None)
+        if not port:
+            print("[SERIAL] Arduino не найдена.")
             self.ser = None
             return False
+        self.ser = serial.Serial(port, self.settings.BAUDRATE, timeout=0.1)
+        time.sleep(1.8)  # ждём автоперезапуск Arduino
+        print(f"[SERIAL] Подключено: {port}")
+        # опциональный хендшейк
+        try:
+            self.ser.reset_input_buffer()
+            self._raw_send("PING")
+            time.sleep(0.2)
+            data = self.ser.read(100).decode(errors="ignore").strip()
+            if data:
+                print("[SERIAL] RX:", data)
+        except Exception:
+            pass
+        return True
 
     # ---------- Калибровка ----------
 
@@ -244,14 +233,15 @@ class TurretController:
 
     # ---------- Коммуникация ----------
 
-    def _send_command(self, line: str):
-        """Отправка строки в Serial (CRLF). Автовосстановление при разрыве."""
+    def _raw_send(self, line: str):
         if not self.ser or not self.ser.is_open:
             if not self.connect_serial():
                 return
+        if not line.endswith("\r\n"):
+            line += "\r\n"
+        if self.settings.DEBUG_TX:
+            print("[TX]", line.strip())
         try:
-            if not line.endswith("\r\n"):
-                line += "\r\n"
             self.ser.write(line.encode())
         except serial.SerialException as e:
             print(f"[SERIAL] Ошибка записи: {e}. Закрываю порт.")
@@ -261,17 +251,23 @@ class TurretController:
                 self.ser = None
 
     def send_angles(self, x_deg, y_deg):
-        """Протокол как у вас: X:...,Y:..."""
-        self._send_command(f"X:{int(x_deg)},Y:{int(y_deg)}")
+        """Поддержка двух протоколов: XY (абсолютные углы 0..180) и ANG (относительные -90..90)."""
+        mode = self.settings.PROTOCOL_MODE.upper()
+        if mode in ("DUAL", "XY"):
+            self._raw_send(f"X:{int(x_deg)},Y:{int(y_deg)}")
+        if mode in ("DUAL", "ANG"):
+            yaw = x_deg - 90.0
+            pitch = y_deg - 90.0
+            self._raw_send(f"ANG {yaw:.1f} {pitch:.1f}")
 
     def send_laser(self, on: bool):
         self.laser_on = on
-        self._send_command("LAS 1" if on else "LAS 0")
+        self._raw_send("LAS 1" if on else "LAS 0")
 
     # ---------- Главный цикл ----------
 
     def run(self):
-        print("Клавиши: Q-выход | L-лазер | C-центр | I/K-инверсия осей | S-сохранить инверсии | U/J +/-Kp")
+        print("Клавиши: Q-выход | L-лазер | C-центр | I/K-инверсия осей | S-сохранить | U/J +/-Kp | P сменить протокол")
         try:
             while True:
                 frame = self._capture_and_process_frame()
@@ -283,12 +279,11 @@ class TurretController:
                 target_pos = self._select_stable_target(results)  # стабильный выбор цели
                 laser_pos = self._detect_laser_dot(frame)
 
-                # состояние с лёгким гистерезисом
+                # состояние + лёгкий гистерезис
                 state = self.state_machine.update(target_pos is not None, laser_pos is not None)
                 now = time.time()
                 if laser_pos:
                     self.last_laser_seen = now
-                # если объект есть, а лазер «мелькнул» недавно — остаёмся в TRACK, чтобы не дёргало
                 if state == "CHASE" and (now - self.last_laser_seen) < 0.3 and target_pos:
                     state = "TRACK"
 
@@ -339,7 +334,6 @@ class TurretController:
             best = max(cand, key=lambda t: t[2])  # старт: крупнейшая
         else:
             px, py = self.prev_target
-            # ближе к прошлой + лёгкое предпочтение крупным
             best = min(cand, key=lambda t: (t[0] - px) ** 2 + (t[1] - py) ** 2 + 0.000001 * (1e8 / max(t[2], 1)))
 
         self.prev_target = (int(best[0]), int(best[1]))
@@ -349,9 +343,8 @@ class TurretController:
     def _detect_laser_dot(self, frame):
         """Обнаружение яркой красной точки, отсекаем шум/блики."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        # красный с высокими S и V — «яркая» точка
         lower1 = np.array([0, 150, 220]);  upper1 = np.array([10, 255, 255])
-        lower2 = np.array([170,150, 220]); upper2 = np.array([179,255, 255])
+        lower2 = np.array([170,150,220]);  upper2 = np.array([179,255,255])
         mask = cv2.inRange(hsv, lower1, upper1) | cv2.inRange(hsv, lower2, upper2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -359,13 +352,12 @@ class TurretController:
             return None
         c = max(contours, key=cv2.contourArea)
         a = cv2.contourArea(c)
-        if a < 3 or a > 150:     # слишком маленькая/большая «клякса» — мимо
+        if a < 3 or a > 150:
             return None
         M = cv2.moments(c)
         if not M["m00"]:
             return None
         x = int(M["m10"] / M["m00"]); y = int(M["m01"] / M["m00"])
-        # игнорируем край кадра (часто блики)
         if x < 10 or x > self.w - 10 or y < 10 or y > self.h - 10:
             return None
         return (x, y)
@@ -376,7 +368,7 @@ class TurretController:
         if state == "IDLE":
             if self.laser_on:
                 self.send_laser(False)
-            # мягко возвращаемся к центру
+            # мягкий возврат к центру
             self.servo_x += (90 - self.servo_x) * 0.1
             self.servo_y += (90 - self.servo_y) * 0.1
             self._maybe_send_angles()
@@ -387,19 +379,16 @@ class TurretController:
             self.send_laser(True)
 
         if state == "TRACK":
-            # ведём по ошибке между целью и лазером
             if target_pos and laser_pos:
                 dx_px = target_pos[0] - laser_pos[0]
                 dy_px = target_pos[1] - laser_pos[1]
                 self._update_servos_from_pixel_error(dx_px, dy_px)
         elif state == "CHASE":
-            # подводим лазер к цели по центру кадра
             if target_pos:
                 dx_px = target_pos[0] - self.center_x
                 dy_px = target_pos[1] - self.center_y
                 self._update_servos_from_pixel_error(dx_px, dy_px)
         elif state == "SEARCH":
-            # спиральный скан
             self.search_radius += self.settings.SEARCH_RADIUS_STEP / 10
             self.search_angle = (self.search_angle + self.settings.SEARCH_ANGLE_STEP) % 360
             ox = self.search_radius * np.cos(np.deg2rad(self.search_angle))
@@ -413,36 +402,29 @@ class TurretController:
                 self.search_radius = 0
 
     def _update_servos_from_pixel_error(self, dx_px, dy_px):
-        """Перевод ошибки в пикселях → градусы → шаги серв с PI-контролем."""
-        # мёртвая зона
+        """Пиксели → градусы → шаги серв с PI-контролем."""
         if abs(dx_px) < self.settings.DEADBAND_PX:
             dx_px = 0
         if abs(dy_px) < self.settings.DEADBAND_PX:
             dy_px = 0
 
-        # пиксели → градусы через FOV
         error_deg_x = (dx_px / self.w) * self.settings.FOV_H_DEG
         error_deg_y = -(dy_px / self.h) * self.settings.FOV_V_DEG  # вверх +
 
-        # инверсии осей (можно переключать в окне клавишами i/k)
         if self.invert_x:
             error_deg_x = -error_deg_x
         if self.invert_y:
             error_deg_y = -error_deg_y
 
-        # PI-контроллер: шаги
         step_x = self.pid_x.calculate_step(error_deg_x, self.kp)
         step_y = self.pid_y.calculate_step(error_deg_y, self.kp)
 
-        # ограничим абсолютный шаг
         step_x = clamp(step_x, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
         step_y = clamp(step_y, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
 
-        # новые углы
         self.servo_x = clamp(self.servo_x + step_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
         self.servo_y = clamp(self.servo_y + step_y, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
 
-        # отправка не чаще CMD_HZ
         self._maybe_send_angles()
 
     def _maybe_send_angles(self):
@@ -460,7 +442,7 @@ class TurretController:
             cv2.circle(frame, laser_pos, 8, (0, 0, 255), 2)      # лазер (красная)
         cv2.circle(frame, (self.center_x, self.center_y), 4, (0, 255, 0), -1)  # центр (зелёный)
 
-        info = f"S:{self.state_machine.state} | Kp:{self.kp:.2f} | INV:{int(self.invert_x)},{int(self.invert_y)}"
+        info = f"S:{self.state_machine.state} | Kp:{self.kp:.2f} | INV:{int(self.invert_x)},{int(self.invert_y)} | PROTO:{self.settings.PROTOCOL_MODE}"
         cv2.putText(frame, info, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     def _handle_keyboard(self):
@@ -468,7 +450,7 @@ class TurretController:
         if key == ord('q'):
             return True
         elif key == ord('l'):
-            self.send_laser(!self.laser_on)  # переключение
+            self.send_laser(not self.laser_on)  # <-- было '!' (исправлено)
         elif key == ord('c'):
             self.servo_x, self.servo_y = 90.0, 90.0
             self.pid_x.reset(); self.pid_y.reset()
@@ -487,6 +469,11 @@ class TurretController:
         elif key == ord('j'):  # -Kp
             self.kp = max(0.0, self.kp - 0.03)
             print(f"Kp = {self.kp:.2f}")
+        elif key == ord('p'):  # смена протокола
+            modes = ["DUAL", "XY", "ANG"]
+            idx = modes.index(self.settings.PROTOCOL_MODE)
+            self.settings.PROTOCOL_MODE = modes[(idx + 1) % len(modes)]
+            print(f"[SERIAL] Протокол -> {self.settings.PROTOCOL_MODE}")
         return False
 
     # ---------- Завершение ----------
@@ -501,7 +488,6 @@ class TurretController:
 
         if self.ser and self.ser.is_open:
             try:
-                # мягко вернуться к центру
                 for _ in range(10):
                     self.servo_x += (90 - self.servo_x) * 0.2
                     self.servo_y += (90 - self.servo_y) * 0.2
