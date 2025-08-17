@@ -32,7 +32,7 @@ class Settings:
     MAX_STEP_DEG = 2.5               # ограничение шага за итерацию
 
     # --- PI (P + I) ---
-    KP = 0.18                        # 0.15–0.25 обычно хорошо
+    KP = 0.18                        # 0.12–0.25 подбирайте на месте
     KI = 0.015
     KD = 0.0
     SMOOTH_FACTOR = 0.6
@@ -50,13 +50,11 @@ class Settings:
     RECONNECT_DELAY_S = 2.0
     CMD_HZ = 25.0                    # частота отправки углов
 
-    # --- Протокол команд к Arduino: "DUAL", "XY", "ANG" ---
-    PROTOCOL_MODE = "DUAL"
+    # --- Протокол команд к Arduino: "XY" (X:..,Y:..), "ANG" (ANG yaw pitch), или "DUAL" ---
+    PROTOCOL_MODE = "ANG"
 
-    # --- Калибровка ---
+    # --- Калибровка/отладка ---
     CALIB_PATH = "calib.json"
-
-    # --- Отладка печатью в консоль ---
     DEBUG_TX = False
 
 
@@ -74,7 +72,6 @@ class PIDController:
         self.bias_limit = bias_limit
         self.bias = 0.0
         self.smoothed_error = 0.0
-        self.last_error = 0.0
 
     def calculate_step(self, error, Kp):
         self.smoothed_error = (
@@ -88,7 +85,6 @@ class PIDController:
     def reset(self):
         self.bias = 0.0
         self.smoothed_error = 0.0
-        self.last_error = 0.0
 
 
 class StateMachine:
@@ -131,13 +127,10 @@ class TurretController:
         self.w, self.h = self.settings.FRAME_SIZE
         self.center_x, self.center_y = self.w // 2, self.h // 2
 
-        # текущие углы (0..180)
         self.servo_x, self.servo_y = 90.0, 90.0
         self.laser_on = False
 
-        # настраиваемый Kp
         self.kp = self.settings.KP
-
         self.pid_x = PIDController(self.settings.KI, self.settings.KD,
                                    self.settings.SMOOTH_FACTOR, self.settings.BIAS_LIMIT)
         self.pid_y = PIDController(self.settings.KI, self.settings.KD,
@@ -147,15 +140,14 @@ class TurretController:
         self.search_radius = 0.0
         self.search_angle = 0.0
 
-        # Память цели и лазера
-        self.prev_target = None
-        self.prev_target_time = 0.0
+        # Память цели, лазера
+        self.prev_target = None  # (cx,cy,x1,y1,x2,y2)
         self.last_laser_seen = 0.0
 
         # лимит частоты отправки углов
         self._next_tx = 0.0
 
-        # калибровка инверсий
+        # калибровка
         self.calib = self._load_calib()
         self._apply_calib()
 
@@ -181,7 +173,6 @@ class TurretController:
         return model
 
     def connect_serial(self):
-        """Автопоиск /dev/ttyUSB*|ttyACM* и подключение."""
         if self.ser and self.ser.is_open:
             return True
         port = next((p.device for p in serial.tools.list_ports.comports()
@@ -191,9 +182,8 @@ class TurretController:
             self.ser = None
             return False
         self.ser = serial.Serial(port, self.settings.BAUDRATE, timeout=0.1)
-        time.sleep(1.8)  # ждём автоперезапуск Arduino
+        time.sleep(1.8)
         print(f"[SERIAL] Подключено: {port}")
-        # опциональный хендшейк
         try:
             self.ser.reset_input_buffer()
             self._raw_send("PING")
@@ -251,7 +241,6 @@ class TurretController:
                 self.ser = None
 
     def send_angles(self, x_deg, y_deg):
-        """Поддержка двух протоколов: XY (абсолютные углы 0..180) и ANG (относительные -90..90)."""
         mode = self.settings.PROTOCOL_MODE.upper()
         if mode in ("DUAL", "XY"):
             self._raw_send(f"X:{int(x_deg)},Y:{int(y_deg)}")
@@ -264,10 +253,26 @@ class TurretController:
         self.laser_on = on
         self._raw_send("LAS 1" if on else "LAS 0")
 
+    # ---------- Геометрия: ошибка «точка → прямоугольник» ----------
+
+    @staticmethod
+    def point_to_rect_error(px, py, x1, y1, x2, y2):
+        """
+        Возвращает (dx,dy) — насколько нужно сдвинуть точку (px,py),
+        чтобы попасть внутрь прямоугольника [x1..x2]×[y1..y2].
+        Если точка уже внутри — (0,0).
+        """
+        # ближайшая точка прямоугольника к (px,py)
+        tx = clamp(px, x1, x2)
+        ty = clamp(py, y1, y2)
+        dx = tx - px
+        dy = ty - py
+        return int(dx), int(dy)
+
     # ---------- Главный цикл ----------
 
     def run(self):
-        print("Клавиши: Q-выход | L-лазер | C-центр | I/K-инверсия осей | S-сохранить | U/J +/-Kp | P сменить протокол")
+        print("Q-выход | L-лазер | C-центр | I/K-инверсия осей | S-сохранить | U/J +/-Kp | P сменить протокол")
         try:
             while True:
                 frame = self._capture_and_process_frame()
@@ -276,21 +281,21 @@ class TurretController:
                 results = self.model.predict(
                     frame, conf=self.settings.CONF_THRESHOLD, imgsz=self.settings.IMGSZ, verbose=False
                 )
-                target_pos = self._select_stable_target(results)  # стабильный выбор цели
+                target = self._select_stable_target(results)   # (cx,cy,x1,y1,x2,y2) или None
                 laser_pos = self._detect_laser_dot(frame)
 
                 # состояние + лёгкий гистерезис
-                state = self.state_machine.update(target_pos is not None, laser_pos is not None)
+                state = self.state_machine.update(target is not None, laser_pos is not None)
                 now = time.time()
                 if laser_pos:
                     self.last_laser_seen = now
-                if state == "CHASE" and (now - self.last_laser_seen) < 0.3 and target_pos:
+                if state == "CHASE" and (now - self.last_laser_seen) < 0.3 and target:
                     state = "TRACK"
 
-                self._handle_state(state, target_pos, laser_pos)
+                self._handle_state(state, target, laser_pos)
 
                 # overlay
-                self._draw_overlay(frame, target_pos, laser_pos)
+                self._draw_overlay(frame, target, laser_pos)
                 cv2.imshow("Auto Aim", frame)
 
                 if self._handle_keyboard():
@@ -312,7 +317,7 @@ class TurretController:
         return frame
 
     def _select_stable_target(self, results):
-        """Стабильный выбор цели: ближняя к прошлой, иначе крупнейшая."""
+        """Стабильный выбор цели: ближняя к прошлой, иначе крупнейшая. Возвращает (cx,cy,x1,y1,x2,y2)."""
         if not results or len(results[0].boxes) == 0:
             self.prev_target = None
             return None
@@ -324,20 +329,19 @@ class TurretController:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                 area = (x2 - x1) * (y2 - y1)
-                cand.append((cx, cy, area))
+                cand.append((cx, cy, x1, y1, x2, y2, area))
 
         if not cand:
             self.prev_target = None
             return None
 
         if self.prev_target is None:
-            best = max(cand, key=lambda t: t[2])  # старт: крупнейшая
+            best = max(cand, key=lambda t: t[6])  # крупнейшая
         else:
-            px, py = self.prev_target
-            best = min(cand, key=lambda t: (t[0] - px) ** 2 + (t[1] - py) ** 2 + 0.000001 * (1e8 / max(t[2], 1)))
+            px, py = self.prev_target[0], self.prev_target[1]
+            best = min(cand, key=lambda t: (t[0] - px) ** 2 + (t[1] - py) ** 2 + 0.000001 * (1e8 / max(t[6], 1)))
 
-        self.prev_target = (int(best[0]), int(best[1]))
-        self.prev_target_time = time.time()
+        self.prev_target = (int(best[0]), int(best[1]), *[int(v) for v in best[2:6]])
         return self.prev_target
 
     def _detect_laser_dot(self, frame):
@@ -364,11 +368,11 @@ class TurretController:
 
     # ---------- Поведение по состояниям ----------
 
-    def _handle_state(self, state, target_pos, laser_pos):
+    def _handle_state(self, state, target, laser_pos):
+        # target = (tcx,tcy,x1,y1,x2,y2) или None
         if state == "IDLE":
             if self.laser_on:
                 self.send_laser(False)
-            # мягкий возврат к центру
             self.servo_x += (90 - self.servo_x) * 0.1
             self.servo_y += (90 - self.servo_y) * 0.1
             self._maybe_send_angles()
@@ -378,16 +382,20 @@ class TurretController:
         if not self.laser_on:
             self.send_laser(True)
 
-        if state == "TRACK":
-            if target_pos and laser_pos:
-                dx_px = target_pos[0] - laser_pos[0]
-                dy_px = target_pos[1] - laser_pos[1]
-                self._update_servos_from_pixel_error(dx_px, dy_px)
-        elif state == "CHASE":
-            if target_pos:
-                dx_px = target_pos[0] - self.center_x
-                dy_px = target_pos[1] - self.center_y
-                self._update_servos_from_pixel_error(dx_px, dy_px)
+        if state in ("TRACK", "CHASE") and target:
+            tcx, tcy, x1, y1, x2, y2 = target
+
+            if laser_pos:
+                # Основная новинка: держим точку ВНУТРИ прямоугольника
+                dx_px, dy_px = self.point_to_rect_error(laser_pos[0], laser_pos[1], x1, y1, x2, y2)
+                # Если уже внутри — ошибки нет, держим как есть
+            else:
+                # Лазер не видим: подводим к центру бокса (быстрее всего завести внутрь)
+                dx_px = tcx - self.center_x
+                dy_px = tcy - self.center_y
+
+            self._update_servos_from_pixel_error(dx_px, dy_px)
+
         elif state == "SEARCH":
             self.search_radius += self.settings.SEARCH_RADIUS_STEP / 10
             self.search_angle = (self.search_angle + self.settings.SEARCH_ANGLE_STEP) % 360
@@ -435,12 +443,14 @@ class TurretController:
 
     # ---------- Визуализация / ввод ----------
 
-    def _draw_overlay(self, frame, target_pos, laser_pos):
-        if target_pos:
-            cv2.circle(frame, target_pos, 8, (255, 0, 0), 2)     # цель (синяя)
+    def _draw_overlay(self, frame, target, laser_pos):
+        if target:
+            tcx, tcy, x1, y1, x2, y2 = target
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)     # бокс цели
+            cv2.circle(frame, (tcx, tcy), 6, (255, 0, 0), 2)               # центр цели (просто как подсказка)
         if laser_pos:
-            cv2.circle(frame, laser_pos, 8, (0, 0, 255), 2)      # лазер (красная)
-        cv2.circle(frame, (self.center_x, self.center_y), 4, (0, 255, 0), -1)  # центр (зелёный)
+            cv2.circle(frame, laser_pos, 8, (0, 0, 255), 2)                 # точка лазера
+        cv2.circle(frame, (self.center_x, self.center_y), 4, (0, 255, 0), -1)
 
         info = f"S:{self.state_machine.state} | Kp:{self.kp:.2f} | INV:{int(self.invert_x)},{int(self.invert_y)} | PROTO:{self.settings.PROTOCOL_MODE}"
         cv2.putText(frame, info, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -450,7 +460,7 @@ class TurretController:
         if key == ord('q'):
             return True
         elif key == ord('l'):
-            self.send_laser(not self.laser_on)  # <-- было '!' (исправлено)
+            self.send_laser(not self.laser_on)
         elif key == ord('c'):
             self.servo_x, self.servo_y = 90.0, 90.0
             self.pid_x.reset(); self.pid_y.reset()
