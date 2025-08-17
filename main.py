@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 from picamera2 import Picamera2
-import cv2, time, numpy as np
+import cv2, time, math, numpy as np
 import serial, serial.tools.list_ports
 from ultralytics import YOLO
 
 # ========= НАСТРОЙКИ =========
 MODEL_PATH   = "yolov8n.pt"
 CONF_THRES   = 0.25
-ONLY         = ["cup"]
+ONLY         = ["cup"]            # какие классы ловим (имена COCO)
 IMGSZ        = 320
 FRAME_SIZE   = (640, 480)
 ROTATE_DEG   = 180
 
+# Параметры наведения
 FOV_H_DEG    = 66.0
 FOV_V_DEG    = 41.0
 Kp_deg       = 0.6
@@ -19,15 +20,23 @@ DEADBAND_PX  = 4
 SMOOTH       = 0.6
 MAX_STEP_DEG = 4.0
 
+# Ограничения серв
 MIN_ANGLE    = 30
 MAX_ANGLE    = 150
 servo_x      = 90.0
 servo_y      = 90.0
 
+# ⚡️ Инверсия осей
+INVERT_X = True
+INVERT_Y = False
+
+# Последовательный порт
 BAUDRATE     = 115200
 RECONNECT_S  = 2.0
 
-# ========== ФУНКЦИИ ==========
+# =============================
+
+
 def find_arduino_port():
     for p in serial.tools.list_ports.comports():
         if "USB" in p.device or "ACM" in p.device:
@@ -36,8 +45,7 @@ def find_arduino_port():
 
 def open_serial():
     port = find_arduino_port()
-    if not port:
-        return None
+    if not port: return None
     try:
         s = serial.Serial(port, BAUDRATE, timeout=0.05)
         time.sleep(1.8)
@@ -48,12 +56,16 @@ def open_serial():
         return None
 
 def send_angles(ser, x, y):
-    if ser: ser.write(f"X:{int(x)},Y:{int(y)}\r\n".encode())
+    if ser is None: return
+    try:
+        ser.write(f"X:{int(x)},Y:{int(y)}\r\n".encode())
+    except: pass
 
 def send_laser(ser, state):
-    """Вкл/выкл лазера (1/0)."""
-    if ser:
-        ser.write(f"LAS {1 if state else 0}\r\n".encode())
+    """Управление лазером: True=вкл, False=выкл"""
+    if ser is None: return
+    cmd = "LAS 1\r\n" if state else "LAS 0\r\n"
+    ser.write(cmd.encode())
 
 def clamp(v, vmin, vmax): return max(vmin, min(vmax, v))
 
@@ -81,15 +93,13 @@ def detect_laser(frame):
     mask2 = cv2.inRange(hsv, (170, 120, 200), (180, 255, 255))
     mask = cv2.bitwise_or(mask1, mask2)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
+    if not contours: return None
     c = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(c) < 3:
-        return None
+    if cv2.contourArea(c) < 3: return None
     M = cv2.moments(c)
-    if M["m00"] == 0:
-        return None
+    if M["m00"] == 0: return None
     return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+
 
 # === КАМЕРА + МОДЕЛЬ ===
 picam2 = Picamera2()
@@ -102,14 +112,14 @@ name2id = {v: k for k, v in model.names.items()}
 wanted_ids = [name2id[n] for n in ONLY if n in name2id]
 
 ser = open_serial()
+
 frame_center = (FRAME_SIZE[0] // 2, FRAME_SIZE[1] // 2)
 last_seen = 0.0
 auto_centered = False
 sx, sy = 0.0, 0.0
+laser_enabled = False
 
-laser_state = False  # текущее состояние лазера
-
-print("Нажмите 'q' для выхода, 'L' для вкл/выкл лазера")
+print("Нажмите 'q' для выхода, 'l' для ручного переключения лазера")
 t0 = time.time(); frames = 0
 try:
     while True:
@@ -123,50 +133,68 @@ try:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         h, w = frame.shape[:2]
+
         res = model.predict(frame, conf=CONF_THRES, imgsz=IMGSZ, verbose=False)
         obj = largest_of_classes(res, wanted_ids)
         laser = detect_laser(frame)
 
-        # Ведение цели
         target_for_error = None
         ref_point = None
-        if obj and laser:
+        if obj is not None and laser is not None:
             target_for_error = obj
             ref_point = laser
             last_seen = time.time()
             auto_centered = False
-        elif obj:
+            # включаем лазер при объекте
+            if not laser_enabled:
+                send_laser(ser, True)
+                laser_enabled = True
+        elif obj is not None:
             target_for_error = obj
             ref_point = frame_center
             last_seen = time.time()
             auto_centered = False
+            if not laser_enabled:
+                send_laser(ser, True)
+                laser_enabled = True
+        else:
+            if laser_enabled:
+                send_laser(ser, False)
+                laser_enabled = False
 
         if target_for_error:
             dx_px = target_for_error[0] - ref_point[0]
             dy_px = target_for_error[1] - ref_point[1]
+
             if abs(dx_px) < DEADBAND_PX: dx_px = 0
             if abs(dy_px) < DEADBAND_PX: dy_px = 0
+
             err_yaw_deg   =  (dx_px / w) * FOV_H_DEG
             err_pitch_deg = -(dy_px / h) * FOV_V_DEG
+
             sx = SMOOTH * sx + (1.0 - SMOOTH) * err_yaw_deg
             sy = SMOOTH * sy + (1.0 - SMOOTH) * err_pitch_deg
-            step_x = clamp(sx * Kp_deg, -MAX_STEP_DEG, MAX_STEP_DEG)
-            step_y = clamp(sy * Kp_deg, -MAX_STEP_DEG, MAX_STEP_DEG)
+
+            step_x = clamp(((-1 if INVERT_X else 1) * sx * Kp_deg), -MAX_STEP_DEG, MAX_STEP_DEG)
+            step_y = clamp(((-1 if INVERT_Y else 1) * sy * Kp_deg), -MAX_STEP_DEG, MAX_STEP_DEG)
+
             servo_x = clamp(servo_x - step_x, MIN_ANGLE, MAX_ANGLE)
             servo_y = clamp(servo_y + step_y, MIN_ANGLE, MAX_ANGLE)
+
             send_angles(ser, servo_x, servo_y)
 
         elif (time.time() - last_seen) > 1.5 and not auto_centered:
             servo_x = 90.0; servo_y = 90.0
             send_angles(ser, servo_x, servo_y)
             auto_centered = True
+            if laser_enabled:
+                send_laser(ser, False)
+                laser_enabled = False
 
-        # Авто-переподключение
         if ser is None or not ser.is_open:
             if (time.time() - last_seen) > RECONNECT_S:
                 ser = open_serial()
 
-        # Рисуем
         if obj:   cv2.circle(frame, obj,   5, (255, 0, 0), -1)
         if laser: cv2.circle(frame, laser, 5, (0, 0, 255), -1)
         cv2.circle(frame, frame_center, 4, (0, 255, 0), 1)
@@ -182,10 +210,9 @@ try:
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('l'):
-            laser_state = not laser_state
-            send_laser(ser, laser_state)
-            print("Laser ON" if laser_state else "Laser OFF")
+        elif key == ord('l'):   # ручное управление лазером
+            laser_enabled = not laser_enabled
+            send_laser(ser, laser_enabled)
 
 except KeyboardInterrupt:
     pass
@@ -193,6 +220,4 @@ finally:
     try: picam2.stop()
     except: pass
     cv2.destroyAllWindows()
-    if ser:
-        try: ser.close()
-        except: pass
+    if ser: ser.close()
