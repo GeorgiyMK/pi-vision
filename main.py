@@ -234,7 +234,6 @@ class TurretController:
     def _send_command(self, command):
         """Отправка команды на Arduino с проверкой подключения."""
         if not self.ser or not self.ser.is_open:
-            # print("[SERIAL] Попытка переподключения...")
             if not self.connect_serial():
                 return
         try:
@@ -282,7 +281,6 @@ class TurretController:
         frame = self.picam2.capture_array()
         if self.settings.ROTATE_DEG == 180:
             return cv2.rotate(frame, cv2.ROTATE_180)
-        # Добавьте другие углы поворота, если нужно
         return frame
 
     def _find_largest_target(self, results):
@@ -308,77 +306,61 @@ class TurretController:
     def _detect_laser_dot(self, frame):
         """Обнаруживает красную точку лазера."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        # Диапазоны для красного цвета
-        lower1 = np.array([0, 80, 180])
+        lower1 = np.array([0, 80, 180]);
         upper1 = np.array([12, 255, 255])
-        lower2 = np.array([168, 80, 180])
+        lower2 = np.array([168, 80, 180]);
         upper2 = np.array([180, 255, 255])
-
-        mask1 = cv2.inRange(hsv, lower1, upper1)
+        mask1 = cv2.inRange(hsv, lower1, upper1);
         mask2 = cv2.inRange(hsv, lower2, upper2)
         mask = cv2.bitwise_or(mask1, mask2)
-
         mask = cv2.GaussianBlur(mask, (3, 3), 0)
         _, mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
-
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
+        if not contours: return None
         c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) < 2:
-            return None
-
+        if cv2.contourArea(c) < 2: return None
         M = cv2.moments(c)
-        if M["m00"] == 0:
-            return None
-
+        if M["m00"] == 0: return None
         return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
 
     def _handle_state(self, state, target_pos, laser_pos):
         """Выполняет действия в зависимости от текущего состояния."""
         if state == "IDLE":
             if self.laser_on: self.send_laser(False)
-            # Плавно возвращаемся в центр
             self.servo_x += (90 - self.servo_x) * 0.1
             self.servo_y += (90 - self.servo_y) * 0.1
             self.send_angles(self.servo_x, self.servo_y)
-            self.search_radius = 0.0  # Сброс поиска
+            self.search_radius = 0.0
             return
 
-        if not self.laser_on:
-            self.send_laser(True)
+        if not self.laser_on: self.send_laser(True)
 
         if state == "TRACK":
-            # Отслеживание: ошибка между точкой лазера и целью
             error_px_x = target_pos[0] - laser_pos[0]
             error_px_y = target_pos[1] - laser_pos[1]
             self._update_servos_from_pixel_error(error_px_x, error_px_y)
 
         elif state == "CHASE":
-            # Преследование: ошибка между центром кадра и целью
             error_px_x = target_pos[0] - self.center_x
             error_px_y = target_pos[1] - self.center_y
             self._update_servos_from_pixel_error(error_px_x, error_px_y)
 
         elif state == "SEARCH":
-            # Поиск: движение по спирали
-            self.search_radius += self.settings.SEARCH_RADIUS_STEP / 10  # замедлим
+            # Поиск: движение по спирали вокруг центра (90,90)
+            self.search_radius += self.settings.SEARCH_RADIUS_STEP / 10
             self.search_angle = (self.search_angle + self.settings.SEARCH_ANGLE_STEP) % 360
 
-            dx_deg = self.search_radius * np.cos(np.deg2rad(self.search_angle))
-            dy_deg = self.search_radius * np.sin(np.deg2rad(self.search_angle))
+            # Смещение в градусах от центра
+            offset_x_deg = self.search_radius * np.cos(np.deg2rad(self.search_angle))
+            offset_y_deg = self.search_radius * np.sin(np.deg2rad(self.search_angle))
 
-            # Применяем смещение к текущим углам
-            # Знак зависит от инверсии
-            sign_x = -1 if self.invert_x else 1
-            sign_y = -1 if self.invert_y else 1
+            # Целевые углы = центр + смещение
+            # Применяем инверсию, если механика работает наоборот
+            target_x = 90 + (offset_x_deg if not self.invert_x else -offset_x_deg)
+            target_y = 90 + (offset_y_deg if not self.invert_y else -offset_y_deg)
 
-            target_servo_x = 90 - sign_x * dx_deg
-            target_servo_y = 90 + sign_y * dy_deg
-
-            self.servo_x = clamp(target_servo_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
-            self.servo_y = clamp(target_servo_y, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
+            self.servo_x = clamp(target_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
+            self.servo_y = clamp(target_y, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
             self.send_angles(self.servo_x, self.servo_y)
 
             if self.search_radius > 25: self.search_radius = 0
@@ -388,21 +370,35 @@ class TurretController:
         if abs(dx_px) < self.settings.DEADBAND_PX: dx_px = 0
         if abs(dy_px) < self.settings.DEADBAND_PX: dy_px = 0
 
-        # Преобразование ошибки из пикселей в градусы
+        # --- Ось X ---
+        # error_deg_x > 0 означает, что цель ПРАВЕЕ лазера/центра
         error_deg_x = (dx_px / self.w) * self.settings.FOV_H_DEG
-        error_deg_y = -(dy_px / self.h) * self.settings.FOV_V_DEG  # Y-ось инвертирована
-
+        # Рассчитываем шаг, который должен переместить лазер вправо
         step_x = self.pid_x.calculate_step(error_deg_x)
+        # Применяем инверсию, если механика работает наоборот
+        if self.invert_x:
+            step_x = -step_x
+
+        # --- Ось Y ---
+        # В координатах изображения Y растет ВНИЗ.
+        # dy_px > 0 означает, что цель НИЖЕ лазера/центра.
+        # Мы преобразуем это в систему, где Y растет ВВЕРХ.
+        # error_deg_y > 0 означает, что цель ВЫШЕ лазера/центра.
+        error_deg_y = -(dy_px / self.h) * self.settings.FOV_V_DEG
+        # Рассчитываем шаг, который должен переместить лазер вверх
         step_y = self.pid_y.calculate_step(error_deg_y)
+        # Применяем инверсию, если механика работает наоборот
+        if self.invert_y:
+            step_y = -step_y
 
-        sign_x = -1 if self.invert_x else 1
-        sign_y = -1 if self.invert_y else 1
+        # Ограничиваем максимальный шаг для плавности
+        final_step_x = clamp(step_x, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
+        final_step_y = clamp(step_y, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
 
-        # Ограничиваем максимальный шаг
-        final_step_x = clamp(sign_x * step_x, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
-        final_step_y = clamp(sign_y * step_y, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
-
-        self.servo_x = clamp(self.servo_x - final_step_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
+        # Обновляем углы сервоприводов.
+        # Предполагаем, что увеличение servo_x двигает лазер ВПРАВО.
+        # Предполагаем, что увеличение servo_y двигает лазер ВВЕРХ.
+        self.servo_x = clamp(self.servo_x + final_step_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
         self.servo_y = clamp(self.servo_y + final_step_y, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
 
         self.send_angles(self.servo_x, self.servo_y)
@@ -413,11 +409,7 @@ class TurretController:
             cv2.circle(frame, target_pos, 8, (255, 0, 0), 2)  # Синий круг - цель
         if laser_pos:
             cv2.circle(frame, laser_pos, 8, (0, 0, 255), 2)  # Красный круг - лазер
-
-        # Центр кадра
         cv2.circle(frame, (self.center_x, self.center_y), 4, (0, 255, 0), -1)
-
-        # Текст состояния
         info_text = f"S: {self.state_machine.state} | INV: {int(self.invert_x)},{int(self.invert_y)} | Bias: {self.pid_x.bias:.1f},{self.pid_y.bias:.1f}"
         cv2.putText(frame, info_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
@@ -449,7 +441,6 @@ class TurretController:
         if self.ser and self.ser.is_open:
             try:
                 self.send_laser(False)
-                # Плавно возвращаем в центр
                 for _ in range(10):
                     self.servo_x += (90 - self.servo_x) * 0.2
                     self.servo_y += (90 - self.servo_y) * 0.2
