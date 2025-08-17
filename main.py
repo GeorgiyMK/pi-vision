@@ -32,7 +32,7 @@ class Settings:
     MAX_STEP_DEG = 5.0  # Максимальное изменение угла за один цикл
 
     # --- Настройки PID-регулятора ---
-    KP = 0.7  # Пропорциональный коэффициент (скорость реакции)
+    KP = 0.4  # НАЧАЛЬНЫЙ Пропорциональный коэффициент (скорость реакции)
     KI = 0.03  # Интегральный коэффициент (коррекция статической ошибки)
     KD = 0.0  # Дифференциальный коэффициент (не используется)
     SMOOTH_FACTOR = 0.6  # Коэффициент сглаживания ошибки
@@ -54,8 +54,8 @@ class Settings:
 class PIDController:
     """Простой PID-регулятор для управления сервоприводами."""
 
-    def __init__(self, Kp, Ki, Kd, smooth_factor, bias_limit):
-        self.Kp = Kp
+    def __init__(self, Ki, Kd, smooth_factor, bias_limit):
+        # Kp теперь управляется извне
         self.Ki = Ki
         self.Kd = Kd
         self.smooth_factor = smooth_factor
@@ -64,20 +64,17 @@ class PIDController:
         self.smoothed_error = 0.0
         self.last_error = 0.0
 
-    def calculate_step(self, error):
+    def calculate_step(self, error, Kp):
         """Рассчитывает шаг для сервопривода на основе ошибки."""
-        # Сглаживание ошибки для более плавной реакции
         self.smoothed_error = self.smooth_factor * self.smoothed_error + (1 - self.smooth_factor) * error
-
-        # Интегральная часть для коррекции постоянной ошибки
         self.bias = clamp(self.bias + self.Ki * self.smoothed_error, -self.bias_limit, self.bias_limit)
 
-        # Дифференциальная часть (пока не используется)
-        derivative = error - self.last_error
-        self.last_error = error
+        # В этой версии мы используем только P и I часть для стабильности
+        # step = Kp * self.smoothed_error + self.bias
 
-        # Пропорциональная часть + Интегральная
-        step = self.Kp * self.smoothed_error + self.bias  # + self.Kd * derivative
+        # УПРОЩЕННАЯ ВЕРСИЯ ДЛЯ НАСТРОЙКИ: ТОЛЬКО P-КОНТРОЛЛЕР
+        step = Kp * error
+
         return step
 
     def reset(self):
@@ -116,13 +113,6 @@ class StateMachine:
 
         return self.state
 
-    def is_state(self, state_name):
-        return self.state == state_name
-
-    def reset_search(self):
-        """Сбрасывает счетчик для режима SEARCH."""
-        self.miss_dot_counter = 0
-
 
 class TurretController:
     """Основной класс, управляющий всей системой."""
@@ -140,9 +130,12 @@ class TurretController:
         self.servo_x, self.servo_y = 90.0, 90.0
         self.laser_on = False
 
-        self.pid_x = PIDController(self.settings.KP, self.settings.KI, self.settings.KD, self.settings.SMOOTH_FACTOR,
+        # Динамический Kp для настройки
+        self.kp = self.settings.KP
+
+        self.pid_x = PIDController(self.settings.KI, self.settings.KD, self.settings.SMOOTH_FACTOR,
                                    self.settings.BIAS_LIMIT)
-        self.pid_y = PIDController(self.settings.KP, self.settings.KI, self.settings.KD, self.settings.SMOOTH_FACTOR,
+        self.pid_y = PIDController(self.settings.KI, self.settings.KD, self.settings.SMOOTH_FACTOR,
                                    self.settings.BIAS_LIMIT)
 
         self.state_machine = StateMachine()
@@ -187,15 +180,14 @@ class TurretController:
                     return cal_data
             except Exception as e:
                 print(f"[CALIB] Ошибка загрузки калибровки: {e}")
-        return {"invert_x": False, "invert_y": False, "bias_x": 0.0, "bias_y": 0.0}
+        # Возвращаем словарь с настройками по умолчанию, если файл не найден или поврежден
+        return {"invert_x": False, "invert_y": False}
 
     def _save_calib(self):
         """Сохранение файла калибровки."""
         self.calib = {
             "invert_x": self.invert_x,
             "invert_y": self.invert_y,
-            "bias_x": self.pid_x.bias,
-            "bias_y": self.pid_y.bias
         }
         try:
             with open(self.settings.CALIB_PATH, "w") as f:
@@ -208,8 +200,6 @@ class TurretController:
         """Применение загруженных настроек калибровки."""
         self.invert_x = self.calib.get("invert_x", False)
         self.invert_y = self.calib.get("invert_y", False)
-        self.pid_x.bias = float(self.calib.get("bias_x", 0.0))
-        self.pid_y.bias = float(self.calib.get("bias_y", 0.0))
 
     def connect_serial(self):
         """Поиск и подключение к Arduino."""
@@ -253,7 +243,7 @@ class TurretController:
     def run(self):
         """Основной цикл программы."""
         print("Нажмите 'Q' в окне для выхода.")
-        print("Клавиши: L - лазер, C - центр, I/K - инверт X/Y, S - сохранить.")
+        print("Клавиши: L-лазер, C-центр, I/K-инверт, S-сохранить, U/J-скорость")
         try:
             while True:
                 frame = self._capture_and_process_frame()
@@ -285,20 +275,17 @@ class TurretController:
 
     def _find_largest_target(self, results):
         """Находит самый большой объект из заданных классов."""
-        if not results or len(results[0].boxes) == 0:
-            return None
-
+        if not results or len(results[0].boxes) == 0: return None
         boxes = results[0].boxes
-        largest_target = None
+        largest_target = None;
         max_area = 0
-
         for box in boxes:
             if int(box.cls.item()) in self.wanted_ids:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 area = (x2 - x1) * (y2 - y1)
                 if area > max_area:
                     max_area = area
-                    cx = int((x1 + x2) / 2)
+                    cx = int((x1 + x2) / 2);
                     cy = int((y1 + y2) / 2)
                     largest_target = (cx, cy)
         return largest_target
@@ -339,30 +326,20 @@ class TurretController:
             error_px_x = target_pos[0] - laser_pos[0]
             error_px_y = target_pos[1] - laser_pos[1]
             self._update_servos_from_pixel_error(error_px_x, error_px_y)
-
         elif state == "CHASE":
             error_px_x = target_pos[0] - self.center_x
             error_px_y = target_pos[1] - self.center_y
             self._update_servos_from_pixel_error(error_px_x, error_px_y)
-
         elif state == "SEARCH":
-            # Поиск: движение по спирали вокруг центра (90,90)
             self.search_radius += self.settings.SEARCH_RADIUS_STEP / 10
             self.search_angle = (self.search_angle + self.settings.SEARCH_ANGLE_STEP) % 360
-
-            # Смещение в градусах от центра
             offset_x_deg = self.search_radius * np.cos(np.deg2rad(self.search_angle))
             offset_y_deg = self.search_radius * np.sin(np.deg2rad(self.search_angle))
-
-            # Целевые углы = центр + смещение
-            # Применяем инверсию, если механика работает наоборот
             target_x = 90 + (offset_x_deg if not self.invert_x else -offset_x_deg)
             target_y = 90 + (offset_y_deg if not self.invert_y else -offset_y_deg)
-
             self.servo_x = clamp(target_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
             self.servo_y = clamp(target_y, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
             self.send_angles(self.servo_x, self.servo_y)
-
             if self.search_radius > 25: self.search_radius = 0
 
     def _update_servos_from_pixel_error(self, dx_px, dy_px):
@@ -370,34 +347,19 @@ class TurretController:
         if abs(dx_px) < self.settings.DEADBAND_PX: dx_px = 0
         if abs(dy_px) < self.settings.DEADBAND_PX: dy_px = 0
 
-        # --- Ось X ---
-        # error_deg_x > 0 означает, что цель ПРАВЕЕ лазера/центра
         error_deg_x = (dx_px / self.w) * self.settings.FOV_H_DEG
-        # Рассчитываем шаг, который должен переместить лазер вправо
-        step_x = self.pid_x.calculate_step(error_deg_x)
-        # Применяем инверсию, если механика работает наоборот
-        if self.invert_x:
-            step_x = -step_x
-
-        # --- Ось Y ---
-        # В координатах изображения Y растет ВНИЗ.
-        # dy_px > 0 означает, что цель НИЖЕ лазера/центра.
-        # Мы преобразуем это в систему, где Y растет ВВЕРХ.
-        # error_deg_y > 0 означает, что цель ВЫШЕ лазера/центра.
         error_deg_y = -(dy_px / self.h) * self.settings.FOV_V_DEG
-        # Рассчитываем шаг, который должен переместить лазер вверх
-        step_y = self.pid_y.calculate_step(error_deg_y)
-        # Применяем инверсию, если механика работает наоборот
-        if self.invert_y:
-            step_y = -step_y
 
-        # Ограничиваем максимальный шаг для плавности
+        # Используем упрощенный контроллер для настройки
+        step_x = self.pid_x.calculate_step(error_deg_x, self.kp)
+        step_y = self.pid_y.calculate_step(error_deg_y, self.kp)
+
+        if self.invert_x: step_x = -step_x
+        if self.invert_y: step_y = -step_y
+
         final_step_x = clamp(step_x, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
         final_step_y = clamp(step_y, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
 
-        # Обновляем углы сервоприводов.
-        # Предполагаем, что увеличение servo_x двигает лазер ВПРАВО.
-        # Предполагаем, что увеличение servo_y двигает лазер ВВЕРХ.
         self.servo_x = clamp(self.servo_x + final_step_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
         self.servo_y = clamp(self.servo_y + final_step_y, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
 
@@ -405,12 +367,10 @@ class TurretController:
 
     def _draw_overlay(self, frame, target_pos, laser_pos):
         """Отрисовка информации на кадре."""
-        if target_pos:
-            cv2.circle(frame, target_pos, 8, (255, 0, 0), 2)  # Синий круг - цель
-        if laser_pos:
-            cv2.circle(frame, laser_pos, 8, (0, 0, 255), 2)  # Красный круг - лазер
+        if target_pos: cv2.circle(frame, target_pos, 8, (255, 0, 0), 2)
+        if laser_pos: cv2.circle(frame, laser_pos, 8, (0, 0, 255), 2)
         cv2.circle(frame, (self.center_x, self.center_y), 4, (0, 255, 0), -1)
-        info_text = f"S: {self.state_machine.state} | INV: {int(self.invert_x)},{int(self.invert_y)} | Bias: {self.pid_x.bias:.1f},{self.pid_y.bias:.1f}"
+        info_text = f"S: {self.state_machine.state} | Kp: {self.kp:.2f} | INV: {int(self.invert_x)},{int(self.invert_y)}"
         cv2.putText(frame, info_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     def _handle_keyboard(self):
@@ -433,6 +393,12 @@ class TurretController:
             print(f"Invert Y: {self.invert_y}")
         elif key == ord('s'):
             self._save_calib()
+        elif key == ord('u'):  # Увеличить Kp
+            self.kp += 0.05
+            print(f"Kp set to: {self.kp:.2f}")
+        elif key == ord('j'):  # Уменьшить Kp
+            self.kp = max(0, self.kp - 0.05)
+            print(f"Kp set to: {self.kp:.2f}")
         return False
 
     def cleanup(self):
@@ -451,10 +417,7 @@ class TurretController:
             except Exception as e:
                 print(f"[SERIAL] Ошибка при закрытии порта: {e}")
 
-        if self.picam2:
-            self.picam2.stop()
-            print("[CAMERA] Камера остановлена.")
-
+        if self.picam2: self.picam2.stop(); print("[CAMERA] Камера остановлена.")
         cv2.destroyAllWindows()
         self._save_calib()
         print("Готово.")
