@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # Raspberry Pi 5 + Cam v3 -> Arduino (2 серво + лазер)
-# УСТОЙЧИВОЕ ВЕДЕНИЕ ЦЕЛИ + АВТОИНВЕРСИЯ ОСЕЙ (anti-runaway)
-# Логика: ведём центр объекта в центр кадра (без обратной связи по пятну).
-# При первом появлении цели — автоопределение знаков осей по малым «тычкам» серво.
-# Если регулятор уводит в упор и ошибка растёт — автоинверт соответствующей оси.
+# Стабильное ведение центра объекта + автоинверсия осей + гистерезис включения лазера + поиск при потере цели.
 
 import time, json, os
 import cv2
 import numpy as np
 import serial, serial.tools.list_ports
-from math import tan, radians
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
@@ -23,27 +19,27 @@ class Cfg:
     FRAME_SIZE     = (640, 480)
     ROTATE_DEG     = 180
 
-    # Камера (фиксированная яркость, без переключений)
+    # Камера (ставим стабильный уровень и не переключаем)
     AE_ENABLE      = True
-    ANALOG_GAIN    = 2.0          # сделай 1.6..2.8 под сцену
-    EXPOSURE_US    = None         # None = авто (если AE_ENABLE=True)
+    ANALOG_GAIN    = 2.0          # 1.6..2.8 по освещению
+    EXPOSURE_US    = None         # None = авто при AE_ENABLE=True
 
     # Геометрия камеры (Cam v3 ~)
     FOV_H_DEG      = 66.0
     FOV_V_DEG      = 41.0
 
-    # Серво (абсолютные углы на Arduino 0..180)
+    # Серво (абсолютные 0..180 на Arduino)
     MIN_ANGLE      = 30
     MAX_ANGLE      = 150
 
     # Контроллер и ограничения
-    KP_X           = 0.22         # П-коэффициенты
+    KP_X           = 0.22
     KP_Y           = 0.22
-    KD_X           = 0.16         # D-демпфер
+    KD_X           = 0.16
     KD_Y           = 0.16
-    DEAD_PX        = 10           # мёртвая зона в пикселях
-    MAX_STEP_DEG   = 3.0          # макс. шаг за цикл (град)
-    CMD_HZ         = 25.0         # частота команд в порт (Гц)
+    DEAD_PX        = 10           # мёртвая зона по пикселям
+    MAX_STEP_DEG   = 3.0          # макс. шаг за цикл
+    CMD_HZ         = 25.0         # частота отправки команд
 
     # Стабилизация цели (alpha-beta)
     ALPHA          = 0.35
@@ -53,20 +49,31 @@ class Cfg:
     BOX_KEEP_FR    = 8            # «липкая» рамка на N кадров
 
     # Автоинверсия
-    AUTO_INV_DELTA_DEG = 6.0      # «тычок» серво при калибровке
-    AUTO_INV_WAIT_S    = 0.15     # ожидание после «тычка»
-    AUTO_INV_SAMPLES   = 4        # усреднение по кадрам
+    AUTO_INV_DELTA_DEG = 6.0
+    AUTO_INV_WAIT_S    = 0.15
+    AUTO_INV_SAMPLES   = 4
 
-    # Анти-разнос
-    RUNAWAY_FRAMES     = 10       # за N кадров ошибка растёт у упора — переворачиваем ось
-    RUNAWAY_EPS        = 6.0      # на сколько пикселей должна вырасти ошибка
+    # Анти-разнос (если у упора и ошибка растёт — инвертируем ось)
+    RUNAWAY_FRAMES     = 10
+    RUNAWAY_EPS        = 6.0
+
+    # Включение лазера с гистерезисом
+    LOCK_ERR_PX        = 28       # порог ошибки (max(|dx|,|dy|) в пикселях) для включения
+    LASER_ON_FRAMES    = 6        # столько кадров подряд «в пределах порога», чтобы включить
+    LASER_OFF_FRAMES   = 8        # столько кадров «вне порога/нет цели», чтобы выключить
+
+    # Поиск при потере цели (скан)
+    SCAN_MIN_ANGLE     = 60
+    SCAN_MAX_ANGLE     = 120
+    SCAN_SPEED_DEG     = 1.2      # шаг сканирования за цикл по X
+    SCAN_STEP_Y        = 0.0      # можно слегка «покачивать» по Y
 
     # Serial
     BAUDRATE       = 115200
     PROTOCOL_MODE  = "XY"         # "XY" или "ANG"
     DEBUG_TX       = False
 
-    # Файл калибровки инверсий
+    # Калибровка инверсий
     CALIB_PATH     = "calib.json"
 # ============================================
 
@@ -115,7 +122,7 @@ class AlphaBeta:
         self.x += self.vx * dt; self.y += self.vy * dt
         if meas is not None:
             mx,my = meas
-            if abs(mx-self.x) + abs(my-self.y) > gate_px:
+            if abs(mx-self.x) + abs(my-self.y) > Cfg.MAX_JUMP_PX:
                 self.miss += 1
             else:
                 rx = mx - self.x; ry = my - self.y
@@ -160,6 +167,14 @@ class Controller:
         self.runaway_x = 0
         self.runaway_y = 0
 
+        # лазер: гистерезис
+        self.laser_on = False
+        self._lock_ok = 0
+        self._lock_bad = 0
+
+        # поиск (скан)
+        self._scan_dir = 1  # 1 вправо, -1 влево
+
     # ---------- камера ----------
     def _init_cam(self):
         cam = Picamera2()
@@ -190,7 +205,9 @@ class Controller:
     # ---------- serial ----------
     def _find_port(self):
         for p in serial.tools.list_ports.comports():
-            if "/ttyUSB" in p.device or "/ttyACM" in p.device:
+            if "/ttyUSB" in p.device or "/ttyACM" in p.device:  # linux
+                return p.device
+            if "USB" in p.device or "ACM" in p.device:           # на всякий случай
                 return p.device
         return None
     def _connect_serial(self):
@@ -220,6 +237,8 @@ class Controller:
             self._raw_send(f"X:{int(ax)},Y:{int(ay)}")
         else:
             self._raw_send(f"ANG {ax-90:.1f} {ay-90:.1f}")
+    def _send_laser(self, on):
+        self.laser_on = on; self._raw_send("LAS 1" if on else "LAS 0")
     def _limit_rate_and_send(self):
         now = time.time()
         if now >= self._next_tx:
@@ -228,28 +247,24 @@ class Controller:
 
     # ---------- автоинверсия осей ----------
     def _avg_target_center(self, n_frames=4):
-        """Собирает несколько кадров и возвращает усреднённый (cx,cy) цели. None если цели нет."""
         acc = []; tries = 0
         while len(acc) < n_frames and tries < n_frames*3:
             frame = self._capture()
             res = self.model.predict(frame, conf=Cfg.CONF_THRESHOLD, imgsz=Cfg.IMGSZ, verbose=False)
             box = select_target_stable(res, self.wanted_ids, None)
-            if box is not None:
-                acc.append((box[0], box[1]))
+            if box is not None: acc.append((box[0], box[1]))
             tries += 1
         if not acc: return None
         mx = int(sum(p[0] for p in acc)/len(acc)); my = int(sum(p[1] for p in acc)/len(acc))
         return (mx, my)
 
     def _auto_invert_axes(self):
-        """Малые «тычки» по X и Y -> смотрим, куда сместился центр бокса; выставляем invert_x/y."""
         print("[AUTOINV] start")
         base = self._avg_target_center(Cfg.AUTO_INV_SAMPLES)
         if base is None:
             print("[AUTOINV] нет цели — пропуск"); return False
         base_x, base_y = base
 
-        # X: подберём знак тычка так, чтобы не упереться в предел
         dx = Cfg.AUTO_INV_DELTA_DEG if self.servo_x + Cfg.AUTO_INV_DELTA_DEG <= Cfg.MAX_ANGLE else -Cfg.AUTO_INV_DELTA_DEG
         self.servo_x = clamp(self.servo_x + dx, Cfg.MIN_ANGLE, Cfg.MAX_ANGLE)
         self._limit_rate_and_send(); time.sleep(Cfg.AUTO_INV_WAIT_S)
@@ -257,16 +272,12 @@ class Controller:
         if after is None:
             print("[AUTOINV] X: цель пропала — пропуск"); return False
         dcx = after[0] - base_x
-        # знак отклика: R = sign(dcx * dservo)
         R = 1 if (dcx*dx) > 0 else -1 if (dcx*dx) < 0 else 0
-        self.invert_x = (R > 0)  # если «в ту же сторону», инвертируем
+        self.invert_x = (R > 0)
         print(f"[AUTOINV] X: dx_servo={dx:+.1f} -> dcx={dcx:+d} => invert_x={self.invert_x}")
-
-        # вернёмся обратно
         self.servo_x = clamp(self.servo_x - dx, Cfg.MIN_ANGLE, Cfg.MAX_ANGLE)
         self._limit_rate_and_send(); time.sleep(0.05)
 
-        # Y
         dy = Cfg.AUTO_INV_DELTA_DEG if self.servo_y + Cfg.AUTO_INV_DELTA_DEG <= Cfg.MAX_ANGLE else -Cfg.AUTO_INV_DELTA_DEG
         self.servo_y = clamp(self.servo_y + dy, Cfg.MIN_ANGLE, Cfg.MAX_ANGLE)
         self._limit_rate_and_send(); time.sleep(Cfg.AUTO_INV_WAIT_S)
@@ -277,13 +288,11 @@ class Controller:
         R = 1 if (dcy*dy) > 0 else -1 if (dcy*dy) < 0 else 0
         self.invert_y = (R > 0)
         print(f"[AUTOINV] Y: dy_servo={dy:+.1f} -> dcy={dcy:+d} => invert_y={self.invert_y}")
-
-        # вернёмся обратно
         self.servo_y = clamp(self.servo_y - dy, Cfg.MIN_ANGLE, Cfg.MAX_ANGLE)
         self._limit_rate_and_send(); time.sleep(0.05)
 
         print("[AUTOINV] done")
-        self._save_calib()  # сохраним на будущее
+        self._save_calib()
         return True
 
     # ---------- управление ----------
@@ -292,14 +301,13 @@ class Controller:
         if abs(err_px_x) < Cfg.DEAD_PX: err_px_x = 0
         if abs(err_px_y) < Cfg.DEAD_PX: err_px_y = 0
 
-        # пиксели -> «градусы камеры»
-        err_deg_x =  (err_px_x / self.w) * Cfg.FOV_H_DEG   # вправо +
-        err_deg_y = -(err_px_y / self.h) * Cfg.FOV_V_DEG   # вверх +
+        # пиксели -> градусы
+        err_deg_x =  (err_px_x / self.w) * Cfg.FOV_H_DEG
+        err_deg_y = -(err_px_y / self.h) * Cfg.FOV_V_DEG
 
         if self.invert_x: err_deg_x = -err_deg_x
         if self.invert_y: err_deg_y = -err_deg_y
 
-        # PD
         now = time.time()
         dt  = max(0.001, now - self.prev_time)
         d_ex = (err_deg_x - self.prev_err_x) / dt
@@ -317,9 +325,8 @@ class Controller:
 
         self._limit_rate_and_send()
 
-        # ---- анти-разнос: если у упора и ошибка растёт, переворачиваем оси ----
+        # анти-разнос
         abs_err_x = abs(err_px_x); abs_err_y = abs(err_px_y)
-        # X
         if (self.servo_x <= Cfg.MIN_ANGLE+0.5 or self.servo_x >= Cfg.MAX_ANGLE-0.5):
             if self.prev_abs_err_x is not None and abs_err_x > self.prev_abs_err_x + Cfg.RUNAWAY_EPS:
                 self.runaway_x += 1
@@ -330,7 +337,6 @@ class Controller:
                 print(f"[ANTI] runaway X -> invert_x={self.invert_x}")
                 self.runaway_x = 0
         self.prev_abs_err_x = abs_err_x
-        # Y
         if (self.servo_y <= Cfg.MIN_ANGLE+0.5 or self.servo_y >= Cfg.MAX_ANGLE-0.5):
             if self.prev_abs_err_y is not None and abs_err_y > self.prev_abs_err_y + Cfg.RUNAWAY_EPS:
                 self.runaway_y += 1
@@ -342,71 +348,17 @@ class Controller:
                 self.runaway_y = 0
         self.prev_abs_err_y = abs_err_y
 
-    # ---------- цикл ----------
-    def run(self):
-        print("Q=выход | I/K — инверт X/Y | U/J — Kp +/- | F/D — Kd +/- | S — сохранить инверсию")
-        try:
-            while True:
-                frame = self._capture()
-                # Детекция
-                results = self.model.predict(frame, conf=Cfg.CONF_THRESHOLD, imgsz=Cfg.IMGSZ, verbose=False)
-                meas_box = select_target_stable(results, self.wanted_ids,
-                                                (self.prev_box[0], self.prev_box[1]) if self.prev_box else None)
+    def _scan_step(self):
+        # простое панорамирование по X в пределах [SCAN_MIN_ANGLE .. SCAN_MAX_ANGLE]
+        self.servo_x += self._scan_dir * Cfg.SCAN_SPEED_DEG
+        if self.servo_x >= Cfg.SCAN_MAX_ANGLE:
+            self.servo_x = Cfg.SCAN_MAX_ANGLE; self._scan_dir = -1
+        elif self.servo_x <= Cfg.SCAN_MIN_ANGLE:
+            self.servo_x = Cfg.SCAN_MIN_ANGLE; self._scan_dir = 1
+        self.servo_y = clamp(self.servo_y + Cfg.SCAN_STEP_Y, Cfg.MIN_ANGLE, Cfg.MAX_ANGLE)
+        self._limit_rate_and_send()
 
-                # «липкая рамка»
-                if meas_box is None and self.prev_box is not None and self.box_hold < Cfg.BOX_KEEP_FR:
-                    meas_cxcy = None; self.box_hold += 1
-                else:
-                    self.box_hold = 0
-                    meas_cxcy = (meas_box[0], meas_box[1]) if meas_box else None
-                    if meas_box: self.prev_box = meas_box
-
-                # автоинверсия — один раз при наличии цели
-                if (not self.auto_inv_done) and self.prev_box is not None:
-                    ok = self._auto_invert_axes()
-                    self.auto_inv_done = ok  # если не получилось, попробует ещё раз при следующем заходе
-
-                # фильтр
-                est = self.filter.update(meas_cxcy, gate_px=Cfg.MAX_JUMP_PX, hold=True)
-                if est is None:
-                    self.prev_box = None  # цель потеряна
-                    # мягко к центру
-                    self.servo_x += (90 - self.servo_x)*0.05
-                    self.servo_y += (90 - self.servo_y)*0.05
-                    self._limit_rate_and_send()
-                else:
-                    ex, ey = est
-                    self._pd_step(ex - self.cx, ey - self.cy)
-
-                # overlay
-                cv2.drawMarker(frame, (self.cx,self.cy), (255,255,255), cv2.MARKER_CROSS, 20, 2)
-                if self.prev_box:
-                    cx,cy,x1,y1,x2,y2 = self.prev_box
-                    cv2.rectangle(frame, (x1,y1), (x2,y2), (255,200,0), 2)
-                    cv2.circle(frame, (cx,cy), 5, (255,0,0), 2)
-                if est is not None:
-                    cv2.circle(frame, (int(est[0]), int(est[1])), 5, (0,255,0), 2)
-
-                info = (f"Kp=({Cfg.KP_X:.2f},{Cfg.KP_Y:.2f}) Kd=({Cfg.KD_X:.2f},{Cfg.KD_Y:.2f}) "
-                        f"invX:{int(self.invert_x)} invY:{int(self.invert_y)} "
-                        f"autoInv:{int(self.auto_inv_done)}")
-                cv2.putText(frame, info, (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
-                cv2.imshow("Stable Object Centering (auto-invert)", frame)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'): break
-                elif key == ord('i'): self.invert_x = not self.invert_x; print("invert_x:", self.invert_x)
-                elif key == ord('k'): self.invert_y = not self.invert_y; print("invert_y:", self.invert_y)
-                elif key == ord('u'): Cfg.KP_X += .03; Cfg.KP_Y += .03; print("Kp:", Cfg.KP_X, Cfg.KP_Y)
-                elif key == ord('j'): Cfg.KP_X = max(0.0, Cfg.KP_X-.03); Cfg.KP_Y = max(0.0, Cfg.KP_Y-.03); print("Kp:", Cfg.KP_X, Cfg.KP_Y)
-                elif key == ord('f'): Cfg.KD_X += .03; Cfg.KD_Y += .03; print("Kd:", Cfg.KD_X, Cfg.KD_Y)
-                elif key == ord('d'): Cfg.KD_X = max(0.0, Cfg.KD_X-.03); Cfg.KD_Y = max(0.0, Cfg.KD_Y-.03); print("Kd:", Cfg.KD_X, Cfg.KD_Y)
-                elif key == ord('s'): self._save_calib()
-
-        finally:
-            self._cleanup()
-
-    # ---------- калибровка инверсий ----------
+    # ---------- калибровка/файлы ----------
     def _load_calib(self):
         if os.path.exists(Cfg.CALIB_PATH):
             try:
@@ -429,9 +381,96 @@ class Controller:
         elif Cfg.ROTATE_DEG == 270: frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return frame
 
+    # ---------- цикл ----------
+    def run(self):
+        print("Q=выход | I/K — инверт X/Y | U/J — Kp +/- | F/D — Kd +/- | S — сохранить инверсию | L — вручную лазер")
+        try:
+            while True:
+                frame = self._capture()
+
+                # Детекция
+                results = self.model.predict(frame, conf=Cfg.CONF_THRESHOLD, imgsz=Cfg.IMGSZ, verbose=False)
+                meas_box = select_target_stable(results, self.wanted_ids,
+                                                (self.prev_box[0], self.prev_box[1]) if self.prev_box else None)
+
+                # «липкая рамка»
+                if meas_box is None and self.prev_box is not None and self.box_hold < Cfg.BOX_KEEP_FR:
+                    meas_cxcy = None; self.box_hold += 1
+                else:
+                    self.box_hold = 0
+                    meas_cxcy = (meas_box[0], meas_box[1]) if meas_box else None
+                    if meas_box: self.prev_box = meas_box
+
+                # автоинверсия — один раз при наличии цели
+                if (not self.auto_inv_done) and self.prev_box is not None:
+                    ok = self._auto_invert_axes()
+                    self.auto_inv_done = ok
+
+                # фильтр
+                est = self.filter.update(meas_cxcy, gate_px=Cfg.MAX_JUMP_PX, hold=True)
+
+                # Управление + лазер с гистерезисом
+                target_visible = (est is not None)
+                if target_visible:
+                    ex, ey = est
+                    dx = ex - self.cx; dy = ey - self.cy
+                    self._pd_step(dx, dy)
+
+                    err_mag = max(abs(dx), abs(dy))
+                    if err_mag <= Cfg.LOCK_ERR_PX:
+                        self._lock_ok += 1
+                        self._lock_bad = 0
+                    else:
+                        self._lock_ok = max(0, self._lock_ok - 1)
+                        self._lock_bad += 1
+
+                    if (not self.laser_on) and self._lock_ok >= Cfg.LASER_ON_FRAMES:
+                        self._send_laser(True)
+                    if self.laser_on and self._lock_bad >= Cfg.LASER_OFF_FRAMES:
+                        self._send_laser(False)
+                else:
+                    # цель потеряна — скан + выключаем лазер (с гистерезисом)
+                    self._lock_ok = 0
+                    self._lock_bad += 1
+                    if self.laser_on and self._lock_bad >= Cfg.LASER_OFF_FRAMES:
+                        self._send_laser(False)
+                    self._scan_step()
+
+                # overlay
+                cv2.drawMarker(frame, (self.cx,self.cy), (255,255,255), cv2.MARKER_CROSS, 20, 2)
+                if self.prev_box:
+                    cx,cy,x1,y1,x2,y2 = self.prev_box
+                    cv2.rectangle(frame, (x1,y1), (x2,y2), (255,200,0), 2)
+                    cv2.circle(frame, (cx,cy), 5, (255,0,0), 2)
+                if est is not None:
+                    cv2.circle(frame, (int(est[0]), int(est[1])), 5, (0,255,0), 2)
+
+                info = (f"invX:{int(self.invert_x)} invY:{int(self.invert_y)} "
+                        f"Kp=({Cfg.KP_X:.2f},{Cfg.KP_Y:.2f}) Kd=({Cfg.KD_X:.2f},{Cfg.KD_Y:.2f}) "
+                        f"Laser:{'ON' if self.laser_on else 'off'} ok:{self._lock_ok} bad:{self._lock_bad}")
+                cv2.putText(frame, info, (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
+                cv2.imshow("Stable Centering + Laser Hysteresis", frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'): break
+                elif key == ord('i'): self.invert_x = not self.invert_x; print("invert_x:", self.invert_x)
+                elif key == ord('k'): self.invert_y = not self.invert_y; print("invert_y:", self.invert_y)
+                elif key == ord('u'): Cfg.KP_X += .03; Cfg.KP_Y += .03; print("Kp:", Cfg.KP_X, Cfg.KP_Y)
+                elif key == ord('j'): Cfg.KP_X = max(0.0, Cfg.KP_X-.03); Cfg.KP_Y = max(0.0, Cfg.KP_Y-.03); print("Kp:", Cfg.KP_X, Cfg.KP_Y)
+                elif key == ord('f'): Cfg.KD_X += .03; Cfg.KD_Y += .03; print("Kd:", Cfg.KD_X, Cfg.KD_Y)
+                elif key == ord('d'): Cfg.KD_X = max(0.0, Cfg.KD_X-.03); Cfg.KD_Y = max(0.0, Cfg.KD_Y-.03); print("Kd:", Cfg.KD_X, Cfg.KD_Y)
+                elif key == ord('s'): self._save_calib()
+                elif key == ord('l'): self._send_laser(not self.laser_on)  # ручной тест лазера
+
+        finally:
+            self._cleanup()
+
     # ---------- завершение ----------
     def _cleanup(self):
         print("\nЗавершение...")
+        try:
+            self._send_laser(False)
+        except: pass
         if self.ser and self.ser.is_open:
             try:
                 for _ in range(10):
