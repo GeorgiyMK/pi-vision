@@ -160,17 +160,11 @@ class AutoCalibrator:
         delta_pixel_y = p2_py - p1_py
         if abs(delta_angle_y) < 1 or abs(delta_pixel_y) < 10: self._fail("Недостаточное смещение по оси Y"); return
 
-        # 1. Вычисляем масштаб (пикселей на градус)
         px_per_deg_x = delta_pixel_x / delta_angle_x
         px_per_deg_y = delta_pixel_y / delta_angle_y
 
-        # 2. Вычисляем смещение центра (где был бы лазер при угле 90,90)
-        # Формула из уравнения прямой: px_center = px1 - (angle1 - 90) * px_per_deg
         center_offset_px_x = p1_px - (p1_ax - 90.0) * px_per_deg_x
         center_offset_px_y = p1_py - (p1_ay - 90.0) * px_per_deg_y
-
-        # 3. Инверсия определяется знаком px_per_deg
-        # (Нам больше не нужно хранить флаг инверсии)
 
         new_calib = {
             "px_per_deg_x": px_per_deg_x,
@@ -267,10 +261,13 @@ class TurretController:
             self.ser.close(); self.ser = None
 
     def send_angles(self, x, y):
-        self.send_command(f"X:{int(x)},Y:{int(y)}\r\n")
+        # ИЗМЕНЕНО: Отправка команды в формате, который понимает ваш скетч Arduino
+        self.send_command(f"SET {int(x)} {int(y)}\r\n")
 
     def send_laser(self, on):
-        self.laser_on = on; self.send_command("LAS 1\r\n" if on else "LAS 0\r\n")
+        self.laser_on = on
+        # ИЗМЕНЕНО: Отправка команды в формате, который понимает ваш скетч Arduino
+        self.send_command("LASER 1\r\n" if on else "LASER 0\r\n")
 
     # --- Методы калибровки ---
     def _load_calib(self):
@@ -279,7 +276,6 @@ class TurretController:
             if os.path.exists(self.settings.CALIB_PATH):
                 with open(self.settings.CALIB_PATH, "r") as f:
                     c = json.load(f)
-                # Проверяем наличие всех необходимых ключей
                 if all(k in c for k in ["px_per_deg_x", "px_per_deg_y", "center_offset_px_x", "center_offset_px_y"]):
                     print("[CALIB] Рабочая калибровка загружена.")
                     return c
@@ -326,23 +322,21 @@ class TurretController:
 
     def _handle_state(self, target_pos, laser_pos):
         """Выполняет действия в зависимости от текущего состояния."""
-        # Если калибровки нет, система может только находиться в IDLE
         if not self.calib and self.state_machine.state != "IDLE":
             self.state_machine.set_state("IDLE")
 
         state = self.state_machine.state
         if state == "IDLE":
             if self.laser_on: self.send_laser(False)
+            self.send_command("HOME\r\n")  # Используем HOME команду из вашего скетча
+            # Обновляем внутренние переменные углов
             self.servo_x += (90 - self.servo_x) * 0.1
             self.servo_y += (90 - self.servo_y) * 0.1
-            self.send_angles(self.servo_x, self.servo_y)
             return
 
         if not self.laser_on: self.send_laser(True)
 
         if state in ["TRACK", "CHASE"]:
-            # В TRACK ошибка считается от лазера, в CHASE - от откалиброванного центра
-            # Это позволяет целиться даже если лазер временно не виден
             current_pos = laser_pos if state == "TRACK" else \
                 (self.calib["center_offset_px_x"], self.calib["center_offset_px_y"])
 
@@ -351,31 +345,26 @@ class TurretController:
             self._update_servos_from_pixel_error(error_px_x, error_px_y)
 
         elif state == "SEARCH":
-            # Спиральный поиск вокруг последнего известного положения цели
             self.search_angle = (self.search_angle + 15) % 360
             radius_factor = abs(((self.state_machine.miss_dot_counter / self.settings.MISS_FRAMES_TO_SEARCH) * 2) - 1)
-            radius = self.settings.SEARCH_RADIUS_MAX_DEG * (
-                        1 - radius_factor)  # Плавное увеличение и уменьшение радиуса
+            radius = self.settings.SEARCH_RADIUS_MAX_DEG * (1 - radius_factor)
 
             offset_x = radius * np.cos(np.deg2rad(self.search_angle))
             offset_y = radius * np.sin(np.deg2rad(self.search_angle))
 
-            # Пересчитываем смещение в градусах в пиксели
             offset_px_x = offset_x * self.calib["px_per_deg_x"]
             offset_px_y = offset_y * self.calib["px_per_deg_y"]
 
-            # Целимся в точку (цель + смещение)
             error_px_x = (target_pos[0] + offset_px_x) - self.calib["center_offset_px_x"]
             error_px_y = (target_pos[1] + offset_px_y) - self.calib["center_offset_px_y"]
             self._update_servos_from_pixel_error(error_px_x, error_px_y)
 
     def _update_servos_from_pixel_error(self, dx_px, dy_px):
         """Ключевой метод: преобразует ошибку в пикселях в команды для серво."""
+        if not self.calib: return
         if abs(dx_px) < self.settings.DEADBAND_PX: dx_px = 0
         if abs(dy_px) < self.settings.DEADBAND_PX: dy_px = 0
 
-        # Преобразуем ошибку в пикселях в ошибку в градусах, используя данные калибровки
-        # Знак инверсии уже учтен в знаке calib['px_per_deg_x']
         error_deg_x = dx_px / self.calib["px_per_deg_x"]
         error_deg_y = dy_px / self.calib["px_per_deg_y"]
 
@@ -416,7 +405,7 @@ class TurretController:
         return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])) if M["m00"] > 0 else None
 
     def _draw_overlay(self, frame, target_pos, laser_pos):
-        if self.calib:  # Рисуем откалиброванный центр
+        if self.calib:
             cx, cy = int(self.calib['center_offset_px_x']), int(self.calib['center_offset_px_y'])
             cv2.drawMarker(frame, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 15, 2)
         if target_pos: cv2.circle(frame, target_pos, 10, (255, 0, 0), 2)
@@ -435,14 +424,13 @@ class TurretController:
             return True
         elif key == ord('a'):
             if self.state_machine.state != "CALIBRATING": self.calibrator.start()
-        # Другие клавиши для отладки можно добавить здесь
         return False
 
     def cleanup(self):
         print("\nЗавершение работы...")
         if self.ser and self.ser.is_open:
-            self.send_laser(False);
-            self.send_angles(90, 90)
+            self.send_laser(False)
+            self.send_command("HOME\r\n")
             self.ser.close();
             print("[CLEANUP] Serial порт закрыт.")
         if self.picam2: self.picam2.stop(); print("[CLEANUP] Камера остановлена.")
@@ -460,3 +448,4 @@ def clamp(v, vmin, vmax): return max(vmin, min(vmax, v))
 if __name__ == '__main__':
     controller = TurretController()
     controller.run()
+
