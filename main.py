@@ -1,352 +1,462 @@
-# tracker.py
-import argparse, json, os, time, math, threading
-import numpy as np
+#!/usr/bin/env python3
 import cv2
-import serial, serial.tools.list_ports
+import time
+import json
+import os
+import numpy as np
+import serial
+import serial.tools.list_ports
+from picamera2 import Picamera2
 from ultralytics import YOLO
 
-# ==== ПАРАМЕТРЫ АППАРАТУРЫ ====
-MODEL_PATH = "yolov8n.pt"   # лёгкая модель; можно заменить на свой .pt
-IMGSZ = 640                 # вход модели
-CONF_THRES = 0.05
-ROTATE_DEG = 180              # 0/90/180/270 если камера перевёрнута
-SERIAL_BAUD = 115200
-SERIAL_PORT_CANDIDATES = ["/dev/ttyACM0", "/dev/ttyUSB0"]
-FRAME_W, FRAME_H = 1280, 720
 
-# Диапазоны серво (подгоняются под механику)
-PAN_MIN, PAN_MAX = 20, 160
-TILT_MIN, TILT_MAX = 30, 150
-PAN_HOME = (PAN_MIN + PAN_MAX) // 2
-TILT_HOME = (TILT_MIN + TILT_MAX) // 2
+# =====================================================================================
+# КЛАССЫ КОНФИГУРАЦИИ И УПРАВЛЕНИЯ
+# =====================================================================================
 
-# Точность удержания (в пикселях) для включения лазера
-PIX_TOLERANCE = 10
-# EMA сглаживание целевой точки (0..1, где 1 = без сглаживания)
-EMA_ALPHA = 0.3
-# Сканирование при потере цели
-SCAN_SPEED_DEG = 0.6
-SCAN_TILT_SWING = 10
-# Таймауты
-HEARTBEAT_PERIOD = 0.2
-LOST_TARGET_TIMEOUT = 0.8
-SERIAL_TIMEOUT_S = 1.0
+class Settings:
+    """Класс для хранения всех настроек и констант."""
+    # --- Модель и камера ---
+    MODEL_PATH = "yolov8n.pt"
+    WANTED_CLASSES = ["cup"]
+    CONF_THRESHOLD = 0.35
+    IMGSZ = 320
+    FRAME_SIZE = (640, 480)
+    ROTATE_DEG = 180
 
-CALIB_FILE = "calib.json"
+    # --- Механика и управление ---
+    MIN_ANGLE = 30
+    MAX_ANGLE = 150
+    DEADBAND_PX = 3
+    MAX_STEP_DEG = 7.0
 
-# ==== КАМЕРА ====
-USE_PICAMERA2 = True
-try:
-    from picamera2 import Picamera2
-except Exception:
-    USE_PICAMERA2 = False
+    # --- PID-регулятор ---
+    KP = 0.8  # Скорость реакции (пропорциональный)
+    KI = 0.04  # Устранение статической ошибки (интегральный)
+    KD = 0.1  # Демпфирование колебаний (дифференциальный)
+    BIAS_LIMIT = 20.0
 
-def open_camera():
-    if USE_PICAMERA2:
-        picam2 = Picamera2()
-        picam2.configure(picam2.create_preview_configuration(
-            main={"format": "RGB888", "size": (FRAME_W, FRAME_H)}
-        ))
-        picam2.start()
-        def read():
-            frame = picam2.capture_array()
-            return frame
-        return read, None
-    else:
-        cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-        def read():
-            ok, frame = cap.read()
-            if not ok: return None
-            return frame
-        return read, cap
+    # --- Состояния ---
+    MISS_FRAMES_TO_SEARCH = 15
+    SEARCH_RADIUS_MAX_DEG = 25.0
+    SEARCH_SPEED_FACTOR = 0.1
 
-def rotate_frame(frame, deg):
-    if deg == 0: return frame
-    if deg == 90: return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if deg == 180: return cv2.rotate(frame, cv2.ROTATE_180)
-    if deg == 270: return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return frame
+    # --- Serial и файлы ---
+    BAUDRATE = 115200
+    CALIB_PATH = "calib.json"
 
-# ==== СЕРИАЛ ====
-def find_serial_port():
-    # сначала фиксированные кандидаты
-    for p in SERIAL_PORT_CANDIDATES:
-        if os.path.exists(p):
-            return p
-    # затем по описанию
-    ports = serial.tools.list_ports.comports()
-    for p in ports:
-        if "Arduino" in p.description or "wchusb" in p.description.lower():
-            return p.device
-    return None
 
-class ArduinoLink:
-    def __init__(self, port, baud=SERIAL_BAUD):
-        self.ser = serial.Serial(port, baudrate=baud, timeout=SERIAL_TIMEOUT_S)
-        time.sleep(2.0)  # ардуино ресет
-        self.lock = threading.Lock()
-        self.last_beat = time.time()
+class PIDController:
+    """PID-регулятор для плавного и точного управления."""
 
-    def cmd(self, txt):
-        with self.lock:
-            self.ser.write((txt.strip() + "\n").encode("ascii"))
+    def __init__(self, Kp, Ki, Kd, bias_limit):
+        self.Kp, self.Ki, self.Kd = Kp, Ki, Kd
+        self.bias_limit = bias_limit
+        self.bias = 0.0  # Интегральная сумма
+        self.last_error = 0.0
 
-    def heartbeat(self):
-        now = time.time()
-        if now - self.last_beat >= HEARTBEAT_PERIOD:
-            self.cmd("PING")
-            self.last_beat = now
+    def calculate_step(self, error):
+        self.bias = clamp(self.bias + error * self.Ki, -self.bias_limit, self.bias_limit)
+        derivative = error - self.last_error
+        self.last_error = error
+        return self.Kp * error + self.bias + self.Kd * derivative
 
-    def set_angles(self, pan, tilt):
-        pan = max(PAN_MIN, min(PAN_MAX, int(round(pan))))
-        tilt = max(TILT_MIN, min(TILT_MAX, int(round(tilt))))
-        self.cmd(f"SET {pan} {tilt}")
+    def reset(self):
+        self.bias = 0.0
+        self.last_error = 0.0
 
-    def laser(self, on):
-        self.cmd("LASER 1" if on else "LASER 0")
 
-    def home(self):
-        self.cmd("HOME")
+class StateMachine:
+    """Управляет состояниями системы, включая калибровку."""
+    VALID_STATES = ["IDLE", "CHASE", "TRACK", "SEARCH", "CALIBRATING"]
 
-# ==== КАЛИБРОВКА ====
-def detect_red_laser(frame_bgr):
-    # поищем ярко-красную точку (две зоны HSV)
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-    mask1 = cv2.inRange(hsv, (0, 120, 150), (10, 255, 255))
-    mask2 = cv2.inRange(hsv, (170, 120, 150), (180, 255, 255))
-    mask = cv2.bitwise_or(mask1, mask2)
-    mask = cv2.medianBlur(mask, 5)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    c = max(cnts, key=cv2.contourArea)
-    area = cv2.contourArea(c)
-    if area < 5:  # отсекаем шум
-        return None
-    M = cv2.moments(c)
-    if M["m00"] == 0:
-        return None
-    cx = int(M["m10"]/M["m00"])
-    cy = int(M["m01"]/M["m00"])
-    return (cx, cy)
+    def __init__(self):
+        self.state = "IDLE"
+        self.miss_dot_counter = 0
 
-def fit_affine(src_pts, dst_pts):
-    # строим аффинное преобразование: [x y 1] * W = [a b] (подгон по МНК)
-    # здесь строим обе модели: (углы)->(пиксели) и (пиксели)->(углы)
-    A = np.hstack([src_pts, np.ones((src_pts.shape[0],1))])  # N x 3
-    B = dst_pts  # N x 2
-    W, *_ = np.linalg.lstsq(A, B, rcond=None)  # 3x2
-    return W  # примен: P = [pan tilt 1] @ W
+    def set_state(self, new_state):
+        if new_state not in self.VALID_STATES: return
+        if self.state != new_state:
+            print(f"[STATE] {self.state} -> {new_state}")
+            self.state = new_state
+            if new_state != "CHASE": self.miss_dot_counter = 0
 
-def invert_mapping(angles_to_px_W, sample_center):
-    # Можно прямо обучить обратную модель по собранным точкам,
-    # но иногда достаточно аналитического псевдообратного.
-    return np.linalg.pinv(angles_to_px_W)
+    def update(self, obj_detected, dot_detected):
+        if self.state == "CALIBRATING": return  # В режиме калибровки состояние не меняется
 
-def save_calib(angles_to_px_W, px_to_angles_W):
-    data = {
-        "angles_to_px_W": angles_to_px_W.tolist(),
-        "px_to_angles_W": px_to_angles_W.tolist(),
-        "frame_size": [FRAME_W, FRAME_H],
-        "rotate_deg": ROTATE_DEG,
-        "pan_limits": [PAN_MIN, PAN_MAX],
-        "tilt_limits": [TILT_MIN, TILT_MAX]
-    }
-    with open(CALIB_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-def load_calib():
-    with open(CALIB_FILE, "r") as f:
-        d = json.load(f)
-    return (np.array(d["angles_to_px_W"]),
-            np.array(d["px_to_angles_W"]),
-            tuple(d["frame_size"]))
-
-def run_calibration():
-    read, cap = open_camera()
-    port = find_serial_port()
-    assert port, "Не найден сериал-порт Arduino"
-    ard = ArduinoLink(port)
-    ard.home(); time.sleep(0.8)
-    ard.laser(False)
-
-    print("[CAL] Начало сканирования… Поставьте систему на ровную стену 1.5–3 м.")
-    # сетка углов
-    pan_vals = np.linspace(PAN_MIN+5, PAN_MAX-5, 8, dtype=int)
-    tilt_vals = np.linspace(TILT_MIN+5, TILT_MAX-5, 6, dtype=int)
-
-    samples_angles = []
-    samples_pixels = []
-
-    try:
-        for t in tilt_vals:
-            for p in pan_vals if ((np.where(tilt_vals==t)[0][0])%2==0) else pan_vals[::-1]:
-                ard.set_angles(p, t)
-                time.sleep(0.18)
-                ard.laser(True)
-                dot = None
-                for _ in range(6):
-                    frame = read()
-                    if frame is None: continue
-                    frame = rotate_frame(frame, ROTATE_DEG)
-                    dot = detect_red_laser(frame)
-                    if dot: break
-                    time.sleep(0.05)
-                ard.laser(False)
-                if dot:
-                    samples_angles.append([p, t])
-                    samples_pixels.append([dot[0], dot[1]])
-                    print(f"[CAL] {p:3d},{t:3d} -> px {dot}")
-                else:
-                    print(f"[CAL] {p:3d},{t:3d} -> нет точки (пропуск)")
-                ard.heartbeat()
-        if len(samples_angles) < 8:
-            raise RuntimeError("Слишком мало калибровочных точек. Повторите.")
-        A = np.array(samples_angles, dtype=float)
-        P = np.array(samples_pixels, dtype=float)
-
-        W_ang2px = fit_affine(A, P)                 # (3x2)
-        # для обратной лучше обучить отдельно: [x y 1] -> [pan tilt]
-        X = np.hstack([P, np.ones((P.shape[0],1))]) # N x 3
-        Y = A                                       # N x 2
-        W_px2ang, *_ = np.linalg.lstsq(X, Y, rcond=None)
-
-        save_calib(W_ang2px, W_px2ang)
-        print("[CAL] Готово. Калибровка записана в", CALIB_FILE)
-    finally:
-        if cap is not None: cap.release()
-
-# ==== ТРЕКИНГ ====
-class AimController:
-    def __init__(self, ard, W_px2ang):
-        self.ard = ard
-        self.W_px2ang = W_px2ang
-        self.target_px_ema = None
-        self.last_seen = 0
-        self.pan = PAN_HOME
-        self.tilt = TILT_HOME
-        self.scan_dir = 1
-        self.scan_phase = 0.0
-        self.holding = False
-
-    def pix_to_angles(self, x, y):
-        X = np.array([x, y, 1.0])
-        pan, tilt = X @ self.W_px2ang  # [3]x[3x2] = [2]
-        return float(pan), float(tilt)
-
-    def update(self, has_target, target_px):
-        now = time.time()
-        self.ard.heartbeat()
-
-        if has_target:
-            self.last_seen = now
-            if self.target_px_ema is None:
-                self.target_px_ema = np.array(target_px, dtype=float)
+        if obj_detected and dot_detected:
+            self.set_state("TRACK")
+        elif obj_detected and not dot_detected:
+            self.miss_dot_counter += 1
+            if self.miss_dot_counter >= Settings.MISS_FRAMES_TO_SEARCH:
+                self.set_state("SEARCH")
             else:
-                self.target_px_ema = (1-EMA_ALPHA)*self.target_px_ema + EMA_ALPHA*np.array(target_px, dtype=float)
-            x, y = self.target_px_ema
-            pan_cmd, tilt_cmd = self.pix_to_angles(x, y)
-            # Ограничения
-            pan_cmd = max(PAN_MIN, min(PAN_MAX, pan_cmd))
-            tilt_cmd = max(TILT_MIN, min(TILT_MAX, tilt_cmd))
-            self.pan, self.tilt = pan_cmd, tilt_cmd
-            self.ard.set_angles(self.pan, self.tilt)
-
-            # точность удержания
-            cx, cy = FRAME_W/2, FRAME_H/2
-            err = math.hypot(x - cx, y - cy)
-            self.holding = err <= PIX_TOLERANCE
-            self.ard.laser(self.holding)
+                self.set_state("CHASE")
         else:
-            # Потеря цели
-            if now - self.last_seen > LOST_TARGET_TIMEOUT:
-                self.target_px_ema = None
-                self.holding = False
-                self.ard.laser(False)
-                # режим сканирования
-                self.scan_phase += SCAN_SPEED_DEG * self.scan_dir
-                if self.scan_phase > (PAN_MAX - PAN_MIN) * 0.9 or self.scan_phase < 0:
-                    self.scan_dir *= -1
-                    self.scan_phase = max(0, min(self.scan_phase, (PAN_MAX - PAN_MIN) * 0.9))
-                pan_cmd = PAN_MIN + self.scan_phase
-                # небольшое покачивание по наклону
-                t = time.time()
-                tilt_cmd = PAN_HOME*0 + TILT_HOME + SCAN_TILT_SWING * math.sin(t*0.8)
-                tilt_cmd = max(TILT_MIN, min(TILT_MAX, tilt_cmd))
-                self.pan, self.tilt = pan_cmd, tilt_cmd
-                self.ard.set_angles(self.pan, self.tilt)
+            self.set_state("IDLE")
 
-def run_tracking(target_labels):
-    # модель
-    model = YOLO(MODEL_PATH)
-    read, cap = open_camera()
-    port = find_serial_port()
-    assert port, "Не найден сериал-порт Arduino"
-    ard = ArduinoLink(port)
-    ard.home(); time.sleep(0.8)
-    ard.laser(False)
 
-    # калибровка
-    W_ang2px, W_px2ang, (fw, fh) = load_calib()
-    assert fw==FRAME_W and fh==FRAME_H, "Размер кадра изменился с момента калибровки – откалибруйте заново."
+# =====================================================================================
+# КЛАСС АВТОМАТИЧЕСКОЙ КАЛИБРОВКИ
+# =====================================================================================
 
-    aim = AimController(ard, W_px2ang)
+class AutoCalibrator:
+    """Выполняет процедуру автоматической калибровки системы."""
 
-    label_set = set([s.strip().lower() for s in target_labels])
+    def __init__(self, controller):
+        self.ctrl = controller
+        self.step = "IDLE"
+        self.cal_points = {
+            "p1_angle": (Settings.MIN_ANGLE + 15, Settings.MIN_ANGLE + 15),
+            "p2_angle": (Settings.MAX_ANGLE - 15, Settings.MAX_ANGLE - 15)
+        }
+        self.measurements = {}
+        self.start_time = 0
 
-    print("[TRACK] Старт. Поиск меток:", label_set)
-    try:
-        while True:
-            frame = read()
-            if frame is None: continue
-            frame = rotate_frame(frame, ROTATE_DEG)
+    def start(self):
+        print("[CALIB] Начало автоматической калибровки.")
+        self.ctrl.state_machine.set_state("CALIBRATING")
+        self.step = "GOTO_P1"
+        self.start_time = time.time()
+        self.ctrl.send_laser(True)
+        self.ctrl.send_angles(*self.cal_points["p1_angle"])
+        return True
 
-            # детекция
-            results = model.predict(source=frame, imgsz=IMGSZ, conf=CONF_THRES, verbose=False)
-            has_target = False
-            target_center = None
+    def run_step(self, laser_pos):
+        """Выполняет один шаг калибровочной машины состояний."""
+        if self.step == "IDLE": return None
 
-            r0 = results[0]
-            for b in r0.boxes:
-                cls_id = int(b.cls)
-                name = r0.names[cls_id].lower()
-                if target_labels and name not in label_set:
-                    continue
-                x1,y1,x2,y2 = map(int, b.xyxy[0].tolist())
-                cx = (x1+x2)//2
-                cy = (y1+y2)//2
-                has_target = True
-                target_center = (cx, cy)
-                break  # берём первую подходящую цель
+        # Ожидание стабилизации сервоприводов
+        if time.time() - self.start_time < 2.0: return None
 
-            aim.update(has_target, target_center if target_center else (0,0))
+        if self.step == "GOTO_P1":
+            if not laser_pos: self._fail("Лазер не найден в точке 1"); return None
+            self.measurements["p1_pixel"] = laser_pos
+            print(f"[CALIB] Точка 1 замерена: Угол={self.cal_points['p1_angle']}, Пиксель={laser_pos}")
+            self.step = "GOTO_P2"
+            self.start_time = time.time()
+            self.ctrl.send_angles(*self.cal_points["p2_angle"])
 
-            # отладочное окно (опционально)
-            # рисуем маркер центра
-            # cv2.circle(frame, (FRAME_W//2, FRAME_H//2), 6, (255,255,255), 2)
-            # if target_center:
-            #     cv2.circle(frame, target_center, 6, (0,255,0), 2)
-            # cv2.imshow("track", frame)
-            # if cv2.waitKey(1) & 0xFF == 27:
-            #     break
-    finally:
-        ard.laser(False)
-        if cap is not None: cap.release()
-        # cv2.destroyAllWindows()
+        elif self.step == "GOTO_P2":
+            if not laser_pos: self._fail("Лазер не найден в точке 2"); return None
+            self.measurements["p2_pixel"] = laser_pos
+            print(f"[CALIB] Точка 2 замерена: Угол={self.cal_points['p2_angle']}, Пиксель={laser_pos}")
+            self._calculate_results()
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--calibrate", action="store_true", help="Запустить самокалибровку по красной точке лазера")
-    ap.add_argument("--track", action="store_true", help="Запустить распознавание и наведение")
-    ap.add_argument("--labels", type=str, default="person", help="Список меток через запятую (пример: person,cup,bottle)")
-    args = ap.parse_args()
+        return None  # Процесс не завершен
 
-    if args.calibrate:
-        run_calibration()
-    elif args.track:
-        labels = [s.strip() for s in args.labels.split(",") if s.strip()]
-        run_tracking(labels)
-    else:
-        print("Укажите --calibrate или --track")
+    def _calculate_results(self):
+        """Вычисляет параметры калибровки на основе двух точек."""
+        p1_ax, p1_ay = self.cal_points["p1_angle"]
+        p2_ax, p2_ay = self.cal_points["p2_angle"]
+        p1_px, p1_py = self.measurements["p1_pixel"]
+        p2_px, p2_py = self.measurements["p2_pixel"]
+
+        delta_angle_x = p2_ax - p1_ax
+        delta_pixel_x = p2_px - p1_px
+        if abs(delta_angle_x) < 1 or abs(delta_pixel_x) < 10: self._fail("Недостаточное смещение по оси X"); return
+
+        delta_angle_y = p2_ay - p1_ay
+        delta_pixel_y = p2_py - p1_py
+        if abs(delta_angle_y) < 1 or abs(delta_pixel_y) < 10: self._fail("Недостаточное смещение по оси Y"); return
+
+        # 1. Вычисляем масштаб (пикселей на градус)
+        px_per_deg_x = delta_pixel_x / delta_angle_x
+        px_per_deg_y = delta_pixel_y / delta_angle_y
+
+        # 2. Вычисляем смещение центра (где был бы лазер при угле 90,90)
+        # Формула из уравнения прямой: px_center = px1 - (angle1 - 90) * px_per_deg
+        center_offset_px_x = p1_px - (p1_ax - 90.0) * px_per_deg_x
+        center_offset_px_y = p1_py - (p1_ay - 90.0) * px_per_deg_y
+
+        # 3. Инверсия определяется знаком px_per_deg
+        # (Нам больше не нужно хранить флаг инверсии)
+
+        new_calib = {
+            "px_per_deg_x": px_per_deg_x,
+            "px_per_deg_y": px_per_deg_y,
+            "center_offset_px_x": center_offset_px_x,
+            "center_offset_px_y": center_offset_px_y,
+        }
+
+        print("[CALIB] Калибровка успешно завершена!")
+        print(f"  - Масштаб X: {px_per_deg_x:.2f} px/deg")
+        print(f"  - Масштаб Y: {px_per_deg_y:.2f} px/deg")
+        print(f"  - Смещение центра: ({center_offset_px_x:.1f}, {center_offset_px_y:.1f}) px")
+
+        self.step = "IDLE"
+        self.ctrl.apply_and_save_calib(new_calib)
+        self.ctrl.state_machine.set_state("IDLE")
+
+    def _fail(self, reason):
+        print(f"[CALIB] ОШИБКА КАЛИБРОВКИ: {reason}")
+        self.step = "IDLE"
+        self.ctrl.state_machine.set_state("IDLE")
+
+
+# =====================================================================================
+# ОСНОВНОЙ КЛАСС КОНТРОЛЛЕРА
+# =====================================================================================
+
+class TurretController:
+    """Основной класс, управляющий всей системой."""
+
+    def __init__(self):
+        self.settings = Settings()
+        self.picam2 = self._init_camera()
+        self.model = self._init_model()
+        self.ser = None
+        self.connect_serial()
+
+        self.w, self.h = self.settings.FRAME_SIZE
+        self.center_x, self.center_y = self.w // 2, self.h // 2
+
+        self.servo_x, self.servo_y = 90.0, 90.0
+        self.laser_on = False
+
+        self.pid_x = PIDController(self.settings.KP, self.settings.KI, self.settings.KD, self.settings.BIAS_LIMIT)
+        self.pid_y = PIDController(self.settings.KP, self.settings.KI, self.settings.KD, self.settings.BIAS_LIMIT)
+
+        self.state_machine = StateMachine()
+        self.calibrator = AutoCalibrator(self)
+
+        self.search_angle = 0.0
+
+        self.calib = self._load_calib()
+
+    # --- Методы инициализации и связи ---
+    def _init_camera(self):
+        try:
+            picam2 = Picamera2()
+            config = picam2.create_preview_configuration(main={"format": "RGB888", "size": self.settings.FRAME_SIZE})
+            picam2.configure(config)
+            picam2.start();
+            print("[INIT] Камера запущена.")
+            return picam2
+        except Exception as e:
+            print(f"[FATAL] Ошибка камеры: {e}"); exit()
+
+    def _init_model(self):
+        try:
+            model = YOLO(self.settings.MODEL_PATH)
+            self.wanted_ids = [k for k, v in model.names.items() if v in self.settings.WANTED_CLASSES]
+            print(f"[INIT] Модель YOLO загружена.")
+            return model
+        except Exception as e:
+            print(f"[FATAL] Ошибка модели: {e}"); exit()
+
+    def connect_serial(self):
+        if self.ser and self.ser.is_open: return True
+        try:
+            port = next(
+                (p.device for p in serial.tools.list_ports.comports() if "USB" in p.device or "ACM" in p.device), None)
+            if not port: self.ser = None; return False
+            self.ser = serial.Serial(port, self.settings.BAUDRATE, timeout=0.1)
+            time.sleep(1.8)
+            print(f"[SERIAL] Подключено к Arduino: {port}")
+            return True
+        except serial.SerialException as e:
+            self.ser = None; return False
+
+    def send_command(self, command):
+        if not self.ser or not self.ser.is_open:
+            if not self.connect_serial(): return
+        try:
+            self.ser.write(command.encode())
+        except serial.SerialException:
+            self.ser.close(); self.ser = None
+
+    def send_angles(self, x, y):
+        self.send_command(f"X:{int(x)},Y:{int(y)}\r\n")
+
+    def send_laser(self, on):
+        self.laser_on = on; self.send_command("LAS 1\r\n" if on else "LAS 0\r\n")
+
+    # --- Методы калибровки ---
+    def _load_calib(self):
+        """Загружает калибровку или возвращает None, если она невалидна."""
+        try:
+            if os.path.exists(self.settings.CALIB_PATH):
+                with open(self.settings.CALIB_PATH, "r") as f:
+                    c = json.load(f)
+                # Проверяем наличие всех необходимых ключей
+                if all(k in c for k in ["px_per_deg_x", "px_per_deg_y", "center_offset_px_x", "center_offset_px_y"]):
+                    print("[CALIB] Рабочая калибровка загружена.")
+                    return c
+        except Exception as e:
+            print(f"[CALIB] Ошибка чтения файла калибровки: {e}")
+
+        print("[WARN] Калибровка не найдена или повреждена. Требуется автоматическая калибровка (клавиша 'A').")
+        return None
+
+    def apply_and_save_calib(self, calib_data):
+        self.calib = calib_data
+        try:
+            with open(self.settings.CALIB_PATH, "w") as f:
+                json.dump(self.calib, f, indent=2)
+            print("[CALIB] Новая калибровка сохранена.")
+        except Exception as e:
+            print(f"[ERROR] Не удалось сохранить калибровку: {e}")
+
+    # --- Основной цикл и логика состояний ---
+    def run(self):
+        print("\nСистема наведения готова. Клавиши: [A] - Автокалибровка, [Q] - Выход.")
+        try:
+            while True:
+                frame = self.picam2.capture_array()
+                if self.settings.ROTATE_DEG == 180: frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+                results = self.model.predict(frame, conf=self.settings.CONF_THRESHOLD, imgsz=self.settings.IMGSZ,
+                                             verbose=False)
+                target_pos = self._find_largest_target(results)
+                laser_pos = self._detect_laser_dot(frame)
+
+                if self.state_machine.state == "CALIBRATING":
+                    self.calibrator.run_step(laser_pos)
+                else:
+                    self.state_machine.update(target_pos is not None, laser_pos is not None)
+                    self._handle_state(target_pos, laser_pos)
+
+                self._draw_overlay(frame, target_pos, laser_pos)
+                cv2.imshow("Guidance System", frame)
+
+                if self._handle_keyboard(): break
+        finally:
+            self.cleanup()
+
+    def _handle_state(self, target_pos, laser_pos):
+        """Выполняет действия в зависимости от текущего состояния."""
+        # Если калибровки нет, система может только находиться в IDLE
+        if not self.calib and self.state_machine.state != "IDLE":
+            self.state_machine.set_state("IDLE")
+
+        state = self.state_machine.state
+        if state == "IDLE":
+            if self.laser_on: self.send_laser(False)
+            self.servo_x += (90 - self.servo_x) * 0.1
+            self.servo_y += (90 - self.servo_y) * 0.1
+            self.send_angles(self.servo_x, self.servo_y)
+            return
+
+        if not self.laser_on: self.send_laser(True)
+
+        if state in ["TRACK", "CHASE"]:
+            # В TRACK ошибка считается от лазера, в CHASE - от откалиброванного центра
+            # Это позволяет целиться даже если лазер временно не виден
+            current_pos = laser_pos if state == "TRACK" else \
+                (self.calib["center_offset_px_x"], self.calib["center_offset_px_y"])
+
+            error_px_x = target_pos[0] - current_pos[0]
+            error_px_y = target_pos[1] - current_pos[1]
+            self._update_servos_from_pixel_error(error_px_x, error_px_y)
+
+        elif state == "SEARCH":
+            # Спиральный поиск вокруг последнего известного положения цели
+            self.search_angle = (self.search_angle + 15) % 360
+            radius_factor = abs(((self.state_machine.miss_dot_counter / self.settings.MISS_FRAMES_TO_SEARCH) * 2) - 1)
+            radius = self.settings.SEARCH_RADIUS_MAX_DEG * (
+                        1 - radius_factor)  # Плавное увеличение и уменьшение радиуса
+
+            offset_x = radius * np.cos(np.deg2rad(self.search_angle))
+            offset_y = radius * np.sin(np.deg2rad(self.search_angle))
+
+            # Пересчитываем смещение в градусах в пиксели
+            offset_px_x = offset_x * self.calib["px_per_deg_x"]
+            offset_px_y = offset_y * self.calib["px_per_deg_y"]
+
+            # Целимся в точку (цель + смещение)
+            error_px_x = (target_pos[0] + offset_px_x) - self.calib["center_offset_px_x"]
+            error_px_y = (target_pos[1] + offset_px_y) - self.calib["center_offset_px_y"]
+            self._update_servos_from_pixel_error(error_px_x, error_px_y)
+
+    def _update_servos_from_pixel_error(self, dx_px, dy_px):
+        """Ключевой метод: преобразует ошибку в пикселях в команды для серво."""
+        if abs(dx_px) < self.settings.DEADBAND_PX: dx_px = 0
+        if abs(dy_px) < self.settings.DEADBAND_PX: dy_px = 0
+
+        # Преобразуем ошибку в пикселях в ошибку в градусах, используя данные калибровки
+        # Знак инверсии уже учтен в знаке calib['px_per_deg_x']
+        error_deg_x = dx_px / self.calib["px_per_deg_x"]
+        error_deg_y = dy_px / self.calib["px_per_deg_y"]
+
+        step_x = self.pid_x.calculate_step(error_deg_x)
+        step_y = self.pid_y.calculate_step(error_deg_y)
+
+        final_step_x = clamp(step_x, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
+        final_step_y = clamp(step_y, -self.settings.MAX_STEP_DEG, self.settings.MAX_STEP_DEG)
+
+        self.servo_x = clamp(self.servo_x + final_step_x, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
+        self.servo_y = clamp(self.servo_y + final_step_y, self.settings.MIN_ANGLE, self.settings.MAX_ANGLE)
+
+        self.send_angles(self.servo_x, self.servo_y)
+
+    # --- Вспомогательные методы ---
+    def _find_largest_target(self, results):
+        if not results or len(results[0].boxes) == 0: return None
+        largest_target = None;
+        max_area = 0
+        for box in results[0].boxes:
+            if int(box.cls.item()) in self.wanted_ids:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                area = (x2 - x1) * (y2 - y1)
+                if area > max_area:
+                    max_area = area
+                    largest_target = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+        return largest_target
+
+    def _detect_laser_dot(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 90, 190), (10, 255, 255)) + \
+               cv2.inRange(hsv, (170, 90, 190), (180, 255, 255))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: return None
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) < 2: return None
+        M = cv2.moments(c)
+        return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])) if M["m00"] > 0 else None
+
+    def _draw_overlay(self, frame, target_pos, laser_pos):
+        if self.calib:  # Рисуем откалиброванный центр
+            cx, cy = int(self.calib['center_offset_px_x']), int(self.calib['center_offset_px_y'])
+            cv2.drawMarker(frame, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 15, 2)
+        if target_pos: cv2.circle(frame, target_pos, 10, (255, 0, 0), 2)
+        if laser_pos: cv2.circle(frame, laser_pos, 10, (0, 0, 255), 2)
+
+        state_text = self.state_machine.state
+        if self.state_machine.state == "CALIBRATING": state_text += f" ({self.calibrator.step})"
+        cv2.putText(frame, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        if not self.calib:
+            cv2.putText(frame, "ТРЕБУЕТСЯ КАЛИБРОВКА (НАЖМИТЕ 'A')", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 165, 255), 2)
+
+    def _handle_keyboard(self):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            return True
+        elif key == ord('a'):
+            if self.state_machine.state != "CALIBRATING": self.calibrator.start()
+        # Другие клавиши для отладки можно добавить здесь
+        return False
+
+    def cleanup(self):
+        print("\nЗавершение работы...")
+        if self.ser and self.ser.is_open:
+            self.send_laser(False);
+            self.send_angles(90, 90)
+            self.ser.close();
+            print("[CLEANUP] Serial порт закрыт.")
+        if self.picam2: self.picam2.stop(); print("[CLEANUP] Камера остановлена.")
+        cv2.destroyAllWindows()
+        print("Готово.")
+
+
+def clamp(v, vmin, vmax): return max(vmin, min(vmax, v))
+
+
+# =====================================================================================
+# ТОЧКА ВХОДА
+# =====================================================================================
+
+if __name__ == '__main__':
+    controller = TurretController()
+    controller.run()
